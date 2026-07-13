@@ -1,0 +1,34 @@
+# 台股AI個人化決策系統 v3.1 - .gitignore
+
+# 環境變數（含敏感金鑰）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 虛擬環境
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 測試暫存
+*.csv
+*.xlsx
+*.parquet

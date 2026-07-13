@@ -1,0 +1,56 @@
+﻿
+======================================================================
+?? 蝡臬蝡舀葫閰?v4.0 ??2330
+======================================================================
+
+? Step 1: ??鞈?...
+  - ?∪... 241 蝑?
+  - ?... 119 蝑?
+  - 鞎∪... 714 蝑?
+  - 鞈鞎銵?.. 3153 蝑?
+  - ?暸?瘚?銵?.. 1095 蝑?
+  - ?∪... 31 蝑?
+  - ?祉?瘥?.. 242 蝑?
+  - 瘜犖... 1210 蝑?
+  - ??... 241 蝑?
+  - ?... 241 蝑?
+
+?? Step 2: 撱箸?瘥”...
+  - 瘥”: 241 銵?x 203 甈?
+
+?? Step 3: 閮?銵?甈?...
+  - 銵?敺? 241 銵?x 223 甈?
+
+?? Step 4: 閮??銵?璅?..
+  - ?銵?璅?: 241 銵?x 248 甈?
+
+?? Step 4b: 閮?鞎∪???...
+  - ?蝯? 241 銵?x 265 甈?
+
+? Step 5: ?◢?潭???..
+python : Traceback (most recent call last):
+位於 線路:1 字元:97
++ ... ONIOENCODING='utf-8'; python test_e2e_v4.py --stock 2330 2>&1 | Out-F ...
++                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "D:\AI?∠巨蝔??TW Stock AI\taiwan-stock-analyzer-v3\test_e2e_v4.py", line 207, in <module>
+    main()
+    ~~~~^^
+  File "D:\AI?∠巨蝔??TW Stock AI\taiwan-stock-analyzer-v3\test_e2e_v4.py", line 135, in main
+    scores = get_all_scores(base)
+  File "D:\AI?∠巨蝔??TW Stock AI\taiwan-stock-analyzer-v3\core\scorer.py", line 1377, in get_all_scores
+    short_result = score_short_term(latest)
+  File "D:\AI?∠巨蝔??TW Stock AI\taiwan-stock-analyzer-v3\core\scorer.py", line 438, in score_short_term
+    volume = score_volume_structure(row)
+  File "D:\AI?∠巨蝔??TW Stock AI\taiwan-stock-analyzer-v3\core\scorer.py", line 263, in score_volume_structure
+    surge_score = five_level_score(vol_trend_ratio, {
+        "_excellent": t["volume_surge_excellent"],
+        "_good": t["volume_surge_good"],
+        "_normal": t["volume_surge_normal"],
+    })
+  File "D:\AI?∠巨蝔??TW Stock AI\taiwan-stock-analyzer-v3\core\scorer.py", line 64, in five_level_score
+    elif value >= thresholds["_weak"]:
+                  ~~~~~~~~~~^^^^^^^^^
+KeyError: '_weak'
