@@ -363,7 +363,12 @@ try:
         }
         
         if df_price.empty:
-            st.error(f"❌ 無法取得股票 {stock_id} 的資料，請確認股票代號是否正確")
+            st.error(f"❌ 無法取得股票 {stock_id} 的股價資料")
+            st.caption("可能原因：")
+            st.caption("1. FinMind API Token 有誤或尚未啟用（申請後需幾分鐘才能用）")
+            st.caption("2. 股票代號不正確（台股請輸入 4 碼數字，如 2330）")
+            st.caption("3. FinMind 伺服器暫時不穩定（可稍後再試）")
+            st.caption("4. 可在 Render Log 中查看 [FETCH_ERROR] 詳細錯誤")
             st.stop()
         
         # 取得股票名稱

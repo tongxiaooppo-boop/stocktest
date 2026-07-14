@@ -43,20 +43,22 @@ def _fetch_finmind(dataset: str, stock_id: str, start_date: str, end_date: str, 
     }
     
     try:
-        resp = requests.get(FINMIND_BASE_URL, params=params, timeout=30)
+        resp = requests.get(FINMIND_BASE_URL, params=params, timeout=60)
         resp.raise_for_status()
         data = resp.json()
         
         if data.get("status") == 200 and data.get("data"):
             return pd.DataFrame(data["data"])
         else:
+            msg = data.get("msg", "無錯誤訊息")
+            print(f"[FETCH_ERROR] {dataset}/{stock_id}: status={data.get('status')}, msg={msg}")
             return pd.DataFrame()
     
     except requests.exceptions.RequestException as e:
-        print(f"[ERROR] FinMind API 呼叫失敗: {dataset} / {stock_id}: {e}")
+        print(f"[FETCH_ERROR] FinMind API 連線失敗: {dataset} / {stock_id}: {e}")
         return pd.DataFrame()
     except Exception as e:
-        print(f"[ERROR] 未知錯誤: {dataset} / {stock_id}: {e}")
+        print(f"[FETCH_ERROR] 未知錯誤: {dataset} / {stock_id}: {e}")
         return pd.DataFrame()
 
 
