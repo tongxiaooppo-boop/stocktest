@@ -1,6 +1,7 @@
-# 台股AI個人化決策系統 v3.1
+# 台股AI個人化決策系統 v4.3
 # 注意：不含 gunicorn，Streamlit 使用內建伺服器
 # API Key 由使用者在網頁輸入，不需 python-dotenv
+# 新聞模組：Yahoo Finance RSS + Google News RSS（使用 feedparser，非 yfinance）
 
 streamlit>=1.28.0
 pandas>=2.0.0
@@ -9,3 +10,6 @@ requests>=2.31.0
 matplotlib>=3.7.0
 scipy>=1.11.0
 openai>=1.0.0
+feedparser>=6.0.0
+snownlp>=0.12.3
+pyyaml>=6.0.0

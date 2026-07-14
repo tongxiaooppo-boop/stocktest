@@ -25,6 +25,7 @@ def analyze_with_deepseek(
     shares: int = 0,
     api_key: str = "",
     trade_advice: object = None,
+    sentiment_data: dict = None,
 ) -> dict:
     """
     呼叫 DeepSeek API 進行 AI 解說分析
@@ -38,6 +39,8 @@ def analyze_with_deepseek(
         avg_price: 持股均價
         shares: 股數
         api_key: DeepSeek API Key（由前端傳入）
+        trade_advice: 持倉判斷物件（可選）
+        sentiment_data: 新聞輿情統計 dict（可選，有資料才傳）
     
     Returns:
         dict: {
@@ -65,6 +68,7 @@ def analyze_with_deepseek(
             stock_id, stock_name, scores, advice,
             has_position, avg_price, shares,
             trade_advice=trade_advice,
+            sentiment_data=sentiment_data,
         )
         
         # 呼叫 DeepSeek API

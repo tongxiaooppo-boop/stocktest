@@ -35,3 +35,9 @@ Thumbs.db
 
 # 開發歸檔（不進入部署）
 archive/
+
+# 新聞 SQLite 資料庫（部署後由容器自動建立）
+news_sentiment.db
+
+# 分析快取目錄（部署後由容器自動建立）
+data/cache/

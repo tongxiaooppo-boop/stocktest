@@ -37,8 +37,12 @@ from core.advisor import get_advice
 from core.trade_manager import generate_trade_advice
 from ai.analyzer import analyze_with_deepseek
 
+# 新聞模組（被動查詢，不影響既有分析流程）
+from news.fetcher import fetch_news
+from news.analyzer import analyze as analyze_news, get_sentiment_label, get_sentiment_color
+from news.database import save_news, get_historical_sentiment, get_aggregate_sentiment
+
 # 設定 matplotlib 支援中文（使用內附 Noto Sans TC 字型）
-import os
 import matplotlib.font_manager as fm
 _font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "NotoSansTC-Regular.otf")
 if os.path.exists(_font_path):
@@ -224,6 +228,10 @@ with st.sidebar:
     
     st.markdown("---")
     backtest_btn = st.button("📊 回測分析", type="secondary", use_container_width=True)
+    
+    st.markdown("---")
+    refresh_cache_btn = st.button("🔄 強制刷新資料", type="secondary", use_container_width=True)
+    st.caption("清除今日快取，下次分析將重新撈取 FinMind")
 
 # ===== 追蹤按鈕點擊事件 =====
 cache_key = f"cache_{stock_id}"
@@ -235,6 +243,28 @@ if backtest_btn:
         st.session_state["_active_tab"] = 2
     else:
         st.session_state["run_backtest"] = False
+
+# 強制刷新：清除 session_state + SQLite + Parquet 快取
+if refresh_cache_btn:
+    # 清除 session 快取
+    if cache_key in st.session_state:
+        del st.session_state[cache_key]
+    st.session_state["analyzed"] = False
+    # 清除 SQLite 快取
+    try:
+        from news.database import delete_analysis_cache
+        delete_analysis_cache(stock_id)
+    except Exception:
+        pass
+    # 清除 Parquet 快取
+    try:
+        cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cache")
+        parquet_path = os.path.join(cache_dir, f"{stock_id}_base.parquet")
+        if os.path.exists(parquet_path):
+            os.remove(parquet_path)
+    except Exception:
+        pass
+    st.info(f"✅ 已清除 {stock_id} 的快取，請再次點擊「開始分析」重新撈取")
 
 # 透過 session_state 記錄分析完成狀態，避免 rerun 時閃過提示文字
 if analyze_btn:
@@ -292,9 +322,39 @@ waterfall_5 = st.empty()  # 風險提示 + 除錯面板
 waterfall_6 = st.empty()  # 回測結果摘要（若有執行過）
 
 try:
-    # ===== 檢查快取：如果已分析過同一支股票，直接從 session_state 讀取 =====
+    # ===== 檢查快取：優先 session_state，其次 SQLite (analysis_cache) =====
     cache_key = f"cache_{stock_id}"
     _has_cache = cache_key in st.session_state
+    
+    # 如果 session_state 沒有快取，嘗試從 SQLite + Parquet 載入
+    if not _has_cache:
+        try:
+            from news.database import load_analysis_cache
+            sql_cache = load_analysis_cache(stock_id)
+            # Parquet 快取路徑
+            cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cache")
+            parquet_path = os.path.join(cache_dir, f"{stock_id}_base.parquet")
+            
+            if sql_cache is not None and os.path.exists(parquet_path):
+                # 檢查快取日期：同一天有效，跨天強制重跑（FinMind 資料可能已更新）
+                cache_date = sql_cache.get("cache_date", "")
+                today = datetime.now().strftime("%Y-%m-%d")
+                cache_is_today = cache_date and cache_date.startswith(today)
+                
+                if cache_is_today:
+                    base = pd.read_parquet(parquet_path)
+                    sql_cache["base"] = base
+                    st.session_state[cache_key] = sql_cache
+                    _has_cache = True
+                else:
+                    # 過期快取，清除後讓系統重新分析
+                    from news.database import delete_analysis_cache
+                    delete_analysis_cache(stock_id)
+                    if os.path.exists(parquet_path):
+                        os.remove(parquet_path)
+                    # 不顯示提示訊息，靜默重新分析
+        except Exception:
+            pass
     
     if _has_cache:
         cache = st.session_state[cache_key]
@@ -423,10 +483,40 @@ try:
         update_progress(77, "🎯 [4/5] 產生基本建議...")
         advice = get_advice(scores)
         
-        # ===== 第 5 段：🤖 AI 解說 (80-100%) =====
+        # ===== (補充) 📰 跟隨個股分析，自動抓取新聞（先抓，AI 解說時可引用） =====
+        news_data = None  # 預設無資料
+        sentiment_data = None  # 輿情統計，供 AI 解說引用
+        try:
+            update_progress(82, "📰 跟隨抓取新聞輿情...")
+            fetched_news = fetch_news(stock_id, limit=10)
+            if fetched_news:
+                # 情緒分析
+                fetched_news = analyze_news(fetched_news, text_field="title")
+                # 先存入 SQLite（讓資料庫累積歷史 + 本次新增）
+                _, _ = save_news(fetched_news)
+                news_data = fetched_news
+                
+                # 短暫 delay 確保 SQLite 檔案寫入完成，再讀取統計供 AI 引用
+                import time
+                time.sleep(0.3)
+                
+                # 從 SQLite 讀取完整統計（包含歷史累積 + 本次新增）
+                try:
+                    from news.database import get_aggregate_sentiment
+                    sentiment_data = get_aggregate_sentiment(stock_id)
+                except Exception:
+                    pass
+                
+                total = sentiment_data["total_news"] if sentiment_data else 0
+                avg = sentiment_data["avg_score"] if sentiment_data else 0
+                update_progress(86, f"📰 歷史累計 {total} 篇 | 情緒 {avg:.2f}" if sentiment_data else "📰 新聞無統計")
+        except Exception:
+            pass  # 新聞沒抓到不影響主分析流程
+
+        # ===== 第 5 段：🤖 AI 解說 (85-100%) =====
         ai_result = None
         if deepseek_api_key:
-            update_progress(82, "🤖 [5/5] AI 解說分析（呼叫 DeepSeek）...")
+            update_progress(90, "🤖 [5/5] AI 解說分析（呼叫 DeepSeek，含輿情參考）...")
             ai_result = analyze_with_deepseek(
                 stock_id=stock_id,
                 stock_name=stock_name,
@@ -437,6 +527,7 @@ try:
                 shares=shares,
                 api_key=deepseek_api_key,
                 trade_advice=trade_advice,
+                sentiment_data=sentiment_data,  # 傳入輿情統計（可能為 None）
             )
         else:
             update_progress(95, "🤖 [5/5] 未設定 API Key，跳過 AI 解說")
@@ -464,6 +555,25 @@ try:
             "df_margin": df_margin,
             "df_ss": df_ss,
         }
+        
+        # 將分析結果持久化到磁碟（SQLite + Parquet），F5 後可直接載入
+        try:
+            from news.database import save_analysis_cache
+            save_analysis_cache(
+                stock_id=stock_id,
+                scores=scores,
+                advice=advice,
+                ai_result=ai_result,
+                trade_advice=trade_advice,
+                fetch_info=fetch_info,
+                stock_name=stock_name,
+            )
+            # 母表存為 Parquet
+            cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            base.to_parquet(os.path.join(cache_dir, f"{stock_id}_base.parquet"), index=False)
+        except Exception:
+            pass  # 快取寫入失敗不影響顯示
         
         update_progress(100, "✅ 分析完成！")
         progress_bar.empty()
@@ -550,7 +660,7 @@ try:
         
         run_bt = st.session_state.get("run_backtest", False)
         
-        tab1, tab2, tab3 = st.tabs(["短線面", "中長線面", "📊 回測分析"])
+        tab1, tab2, tab3, tab4 = st.tabs(["短線面", "中長線面", "📊 回測分析", "📰 新聞輿情"])
         
         with tab1:
             st.markdown("**短線面圖表（近 1 個月）**")
@@ -1139,6 +1249,124 @@ try:
                                     st.metric(f"{scn}", f"{tc}筆", f"{ret:+.1f}%" if ret != 0 else "0%")
                                     win_rate_str = f"勝率: {wr:.0f}%" if wr is not None else "勝率: -"
                                     st.caption(win_rate_str)
+    
+        # ===== Tab 4: 📰 新聞輿情 =====
+        with tab4:
+            st.markdown("**📰 新聞輿情分析**")
+            st.caption("分析時已自動抓取新聞存入資料庫，下方直接顯示歷史數據。可點「更新新聞」手動重新抓取。")
+            
+            # 新聞查詢輸入與更新按鈕
+            col_news_input, col_news_btn = st.columns([3, 1])
+            with col_news_input:
+                news_stock_id = st.text_input("查詢其他股票代號", placeholder=stock_id, max_chars=6, key="news_stock_input")
+            with col_news_btn:
+                st.caption("&nbsp;")
+                news_search_btn = st.button("🔄 更新新聞", type="primary", use_container_width=True)
+            
+            # 決定要顯示哪個股票的：若無手動輸入則自動跟隨側邊欄 stock_id
+            display_stock_id = news_stock_id.strip() if news_stock_id and news_stock_id.strip() else stock_id
+            
+            # 手動更新新聞
+            if news_search_btn:
+                with st.spinner(f"⏳ 正在抓取 {display_stock_id} 的最新新聞並進行情緒分析..."):
+                    fetched_list = fetch_news(display_stock_id, limit=10)
+                    if fetched_list:
+                        fetched_list = analyze_news(fetched_list, text_field="title")
+                        inserted, total = save_news(fetched_list)
+                        if inserted > 0:
+                            st.success(f"✅ 新增 {inserted} 篇新聞")
+                        else:
+                            st.info(f"ℹ️ 無新新聞（已是最新）")
+            
+            # 無論是否按更新，都從資料庫讀取現有數據顯示
+            agg = get_aggregate_sentiment(display_stock_id)
+            history = get_historical_sentiment(display_stock_id, limit=50)
+            
+            if not history:
+                st.info("📭 尚無新聞資料，請先執行「🔍 開始分析」或點「更新新聞」手動抓取")
+            else:
+                # 綜合情緒指標
+                if agg:
+                    st.markdown("---")
+                    st.subheader("📊 綜合情緒統計")
+                    avg_score = agg["avg_score"]
+                    label = get_sentiment_label(avg_score)
+                    
+                    col_agg1, col_agg2, col_agg3, col_agg4 = st.columns(4)
+                    with col_agg1:
+                        st.metric("📰 歷史新聞數", f"{agg['total_news']} 篇")
+                    with col_agg2:
+                        st.metric("📈 平均情緒", f"{avg_score:.4f}", label)
+                    with col_agg3:
+                        st.metric("🟢 偏多", f"{agg['positive_count']} 篇")
+                    with col_agg4:
+                        st.metric("🔴 偏空", f"{agg['negative_count']} 篇")
+                    
+                    # 情緒分佈條
+                    st.markdown("**情緒分佈**")
+                    if agg["total_news"] > 0:
+                        pos_pct = agg["positive_count"] / agg["total_news"] * 100
+                        neg_pct = agg["negative_count"] / agg["total_news"] * 100
+                        neu_pct = agg["neutral_count"] / agg["total_news"] * 100
+                        st.markdown(
+                            f"""
+                            <div style="display:flex; height:24px; border-radius:12px; overflow:hidden; margin:8px 0;">
+                                <div style="flex:{pos_pct:.1f}; background:#FF6B6B; display:flex; align-items:center; justify-content:center; font-size:12px; color:white; min-width:30px;">{pos_pct:.0f}%</div>
+                                <div style="flex:{neu_pct:.1f}; background:#DDD; display:flex; align-items:center; justify-content:center; font-size:12px; color:#666; min-width:30px;">{neu_pct:.0f}%</div>
+                                <div style="flex:{neg_pct:.1f}; background:#51CF66; display:flex; align-items:center; justify-content:center; font-size:12px; color:white; min-width:30px;">{neg_pct:.0f}%</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        st.caption("🔴 偏多 | ⚪ 中性 | 🟢 偏空")
+                
+                # 最新新聞表格
+                st.markdown("---")
+                st.subheader("📋 最新新聞（近 50 筆）")
+                
+                news_rows = []
+                for n in history:
+                    score = n["sentiment_score"]
+                    news_rows.append({
+                        "時間": n["publish_time"][:16],
+                        "來源": n["source"],
+                        "標題": n["title"],
+                        "情緒分數": score,
+                        "判定": get_sentiment_label(score),
+                    })
+                
+                if news_rows:
+                    df_news = pd.DataFrame(news_rows)
+                    st.dataframe(
+                        df_news,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "情緒分數": st.column_config.NumberColumn(format="%.4f"),
+                        }
+                    )
+                
+                # 歷史情緒趨勢圖
+                st.markdown("---")
+                st.subheader("📈 歷史情緒趨勢")
+                df_history = pd.DataFrame(history)
+                df_history["publish_time"] = pd.to_datetime(df_history["publish_time"])
+                df_history = df_history.sort_values("publish_time")
+                
+                fig_news, ax_news = plt.subplots(figsize=(12, 4))
+                ax_news.plot(df_history["publish_time"], df_history["sentiment_score"], 
+                            color="purple", linewidth=1.5, marker="o", markersize=4)
+                ax_news.axhline(y=0.2, color="red", linestyle="--", alpha=0.5, label="偏多門檻 (+0.2)")
+                ax_news.axhline(y=0, color="gray", linestyle="-", alpha=0.3)
+                ax_news.axhline(y=-0.2, color="green", linestyle="--", alpha=0.5, label="偏空門檻 (-0.2)")
+                ax_news.set_title(f"{news_stock_id} - 新聞情緒趨勢（近50筆）")
+                ax_news.set_ylabel("情緒分數")
+                ax_news.set_xlabel("時間")
+                ax_news.legend(loc="best")
+                ax_news.grid(True, alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig_news)
+                plt.close()
     
     # ===== 瀑布流 3：評分完成 → 四維度分析卡 + 基本建議 =====
     with waterfall_3.container():
