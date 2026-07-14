@@ -32,3 +32,6 @@ Thumbs.db
 *.csv
 *.xlsx
 *.parquet
+
+# 開發歸檔（不進入部署）
+archive/

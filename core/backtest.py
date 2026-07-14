@@ -1,17 +1,22 @@
 """
-core/backtest.py v1.0
+core/backtest.py
 回測分析模組 — 結合 walk-forward 評分與買賣訊號解析
 
 提供：
 1. run_backtest()：執行完整回測，產出五種策略（短線/波段/價值/定存/綜合）的交易記錄
-2. 買賣訊號：基於分數 threshold 交叉，獨立於 trade_manager
-3. 綜合策略：任一 ≥70 買入，≥2 種 <50 賣出，加權平均成本
+2. run_dual_backtest()：同時跑積極(70/50)與保守(60/40)兩種策略，並存檔
+3. 買賣訊號：基於分數 threshold 交叉，獨立於 trade_manager
+4. 綜合策略：≥2 種 ≥ buy_threshold 買入，≥2 種 < sell_threshold 賣出，加權平均成本
 """
 import pandas as pd
 import numpy as np
+import os
 from datetime import datetime, date
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+# 引入雙軌建議價計算
+from core.trade_manager import _calc_dual_entry_prices
 
 
 # ============================================================
@@ -38,6 +43,7 @@ class BacktestResult:
     freq: str = "W"
     buy_threshold: int = 70
     sell_threshold: int = 50
+    strategy: str = ""  # "active" 或 "conservative"
     
     # 五種策略各自的交易記錄
     styles: dict = field(default_factory=lambda: {
@@ -52,6 +58,10 @@ class BacktestResult:
     signal_history: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
+# ============================================================
+# 核心回測
+# ============================================================
+
 def run_backtest(
     df: pd.DataFrame,
     stock_id: str,
@@ -60,6 +70,7 @@ def run_backtest(
     freq: str = 'W',
     buy_threshold: int = 70,
     sell_threshold: int = 50,
+    strategy: str = "",
 ) -> BacktestResult:
     """
     執行完整回測
@@ -77,11 +88,21 @@ def run_backtest(
         freq: 頻率（D/W/M/Q）
         buy_threshold: 買入門檻分數（預設 70）
         sell_threshold: 賣出門檻分數（預設 50）
+        strategy: 策略名稱（"active" 或 "conservative"，留空則自動判斷）
     
     Returns:
         BacktestResult: 完整回測結果
     """
     from core.scorer import get_historical_scores
+    
+    # 自動判斷策略名稱
+    if not strategy:
+        if buy_threshold >= 70 and sell_threshold <= 50:
+            strategy = "active"
+        elif buy_threshold >= 60 and sell_threshold <= 40:
+            strategy = "conservative"
+        else:
+            strategy = f"b{buy_threshold}s{sell_threshold}"
     
     # === 1. 取得歷史分數 ===
     hist_df = get_historical_scores(
@@ -99,6 +120,7 @@ def run_backtest(
             freq=freq,
             buy_threshold=buy_threshold,
             sell_threshold=sell_threshold,
+            strategy=strategy,
         )
     
     # 確保 date 是 datetime
@@ -135,6 +157,7 @@ def run_backtest(
         freq=freq,
         buy_threshold=buy_threshold,
         sell_threshold=sell_threshold,
+        strategy=strategy,
     )
     
     # === 2. 五種策略各自解析買賣訊號 ===
@@ -151,7 +174,7 @@ def run_backtest(
         result.styles[style]["total_return_pct"] = _calc_total_return(trades)
         result.styles[style]["win_rate"] = _calc_win_rate(trades)
     
-    # 綜合策略：任一 ≥70 買入，≥2 種 <50 賣出
+    # 綜合策略
     composite_trades = _parse_composite_trades(
         hist_df, style_scores,
         buy_threshold, sell_threshold,
@@ -162,17 +185,94 @@ def run_backtest(
     result.styles["composite"]["win_rate"] = _calc_win_rate(composite_trades)
     
     # === 3. 訊號歷史（給 CSV 輸出和圖表用） ===
+    tech_cols = ["MA_5", "MA_10", "MA_20", "MA_60", "pe_ratio", "PE_Percentile",
+                 "pb_ratio", "PB_Percentile", "Inst_Net", "dividend_yield"]
+    df_tech = df[["date"] + [c for c in tech_cols if c in df.columns]].copy() if "date" in df.columns else pd.DataFrame()
+    if not df_tech.empty:
+        df_tech["date"] = pd.to_datetime(df_tech["date"])
+        df_tech = df_tech.sort_values("date").drop_duplicates(subset=["date"])
+    
+    # 對齊 high/low（用於判斷建議價區間是否可成交）
+    price_cols = ["high", "low", "close"]
+    df_price_ext = df[["date"] + [c for c in price_cols if c in df.columns]].copy() if "date" in df.columns else pd.DataFrame()
+    if not df_price_ext.empty:
+        df_price_ext["date"] = pd.to_datetime(df_price_ext["date"])
+        df_price_ext = df_price_ext.sort_values("date").drop_duplicates(subset=["date"])
+    
     signal_records = []
     for i, row in hist_df.iterrows():
         record = {
             "date": row["date"],
             "price": row.get("close", np.nan),
         }
+        # 對齊技術指標
+        if not df_tech.empty:
+            tech_row = df_tech[df_tech["date"] == row["date"]]
+            if tech_row.empty:
+                idx = (df_tech["date"] - row["date"]).abs().idxmin()
+                tech_row = df_tech.loc[[idx]]
+            if not tech_row.empty:
+                for c in tech_cols:
+                    if c in tech_row.columns:
+                        record[c] = tech_row[c].iloc[0]
+        
+        # 對齊 high/low
+        day_high = np.nan
+        day_low = np.nan
+        if not df_price_ext.empty:
+            pr_row = df_price_ext[df_price_ext["date"] == row["date"]]
+            if pr_row.empty:
+                idx = (df_price_ext["date"] - row["date"]).abs().idxmin()
+                pr_row = df_price_ext.loc[[idx]]
+            if not pr_row.empty:
+                day_high = pr_row["high"].iloc[0] if "high" in pr_row.columns else np.nan
+                day_low = pr_row["low"].iloc[0] if "low" in pr_row.columns else np.nan
+        record["high"] = day_high
+        record["low"] = day_low
+        
+        # 計算雙軌建議價（使用 trade_manager 的折扣法）
+        close_price = row.get("close", np.nan)
+        ma_20_val = record.get("MA_20", np.nan)
+        ma_5_val = record.get("MA_5", np.nan)
+        pe_pct_val = record.get("PE_Percentile", np.nan)
+        
+        # 取當日各風格最高分作為 best_score（對應 trade_manager 的邏輯）
+        scores_today = [row.get(sc, 0) for sc in style_scores.values()]
+        scores_today = [s if pd.notna(s) else 0 for s in scores_today]
+        best_score_today = max(scores_today) if scores_today else 0
+        
+        if pd.notna(close_price) and pd.notna(ma_5_val) and best_score_today > 0:
+            agg_c, agg_l, agg_h, cons_c, cons_l, cons_h = _calc_dual_entry_prices(
+                close_price, pe_pct_val if pd.notna(pe_pct_val) else None,
+                ma_20_val if pd.notna(ma_20_val) else None,
+                ma_5_val if pd.notna(ma_5_val) else None,
+                best_score_today,
+            )
+            record["agg_low"] = agg_l
+            record["agg_high"] = agg_h
+            record["cons_low"] = cons_l
+            record["cons_high"] = cons_h
+            
+            # price_in_range：當日 low~high 範圍與積極或保守區間有交集即 True
+            in_range = False
+            if pd.notna(day_high) and pd.notna(day_low):
+                if agg_h is not None and agg_l is not None:
+                    if day_low <= agg_h and day_high >= agg_l:
+                        in_range = True
+                if not in_range and cons_h is not None and cons_l is not None:
+                    if day_low <= cons_h and day_high >= cons_l:
+                        in_range = True
+            record["price_in_range"] = in_range
+        else:
+            record["agg_low"] = np.nan
+            record["agg_high"] = np.nan
+            record["cons_low"] = np.nan
+            record["cons_high"] = np.nan
+            record["price_in_range"] = False
         for style in style_keys:
             score_col = style_scores[style]
             record[score_col] = row.get(score_col, np.nan)
             
-            # 檢查該時間點是否剛好買入
             trades_for_style = result.styles[style]["trades"]
             buy_signal = False
             sell_signal = False
@@ -187,7 +287,6 @@ def run_backtest(
             elif sell_signal:
                 record[f"{style}_signal"] = "sell"
             else:
-                # 檢查是否持有中
                 holding = False
                 for t in trades_for_style:
                     if t.status == "持有中":
@@ -203,6 +302,103 @@ def run_backtest(
     
     return result
 
+
+# ============================================================
+# 雙策略回測（積極 + 保守同時跑）
+# ============================================================
+
+def run_dual_backtest(
+    df: pd.DataFrame,
+    stock_id: str,
+    start_date: str = None,
+    end_date: str = None,
+    freq: str = 'W',
+    output_dir: str = None,
+) -> Tuple[BacktestResult, BacktestResult]:
+    """
+    同時執行積極(70/50)和保守(60/40)兩種策略的回測
+    
+    Parameters:
+        df: 母表 DataFrame
+        stock_id: 股票代號
+        start_date: 回測起始日
+        end_date: 回測結束日
+        freq: 頻率（D/W/M/Q）
+        output_dir: 輸出目錄，若指定則自動存檔
+    
+    Returns:
+        (active_result, conservative_result): 兩種策略的回測結果
+    """
+    # 積極策略：買≥70 / 賣<50
+    result_active = run_backtest(
+        df=df, stock_id=stock_id,
+        start_date=start_date, end_date=end_date,
+        freq=freq,
+        buy_threshold=70, sell_threshold=50,
+        strategy="active",
+    )
+    
+    # 保守策略：買≥60 / 賣<40
+    result_conservative = run_backtest(
+        df=df, stock_id=stock_id,
+        start_date=start_date, end_date=end_date,
+        freq=freq,
+        buy_threshold=60, sell_threshold=40,
+        strategy="conservative",
+    )
+    
+    # 若指定輸出目錄，則自動存檔
+    if output_dir:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = output_dir
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 積極
+        active_path = os.path.join(save_dir, f"backtest_{stock_id}_{timestamp}_70_50.csv")
+        _save_to_csv(result_active, active_path)
+        
+        # 保守
+        conservative_path = os.path.join(save_dir, f"backtest_{stock_id}_{timestamp}_60_40.csv")
+        _save_to_csv(result_conservative, conservative_path)
+        
+        print(f"  積極 → {os.path.basename(active_path)}")
+        print(f"  保守 → {os.path.basename(conservative_path)}")
+    
+    return result_active, result_conservative
+
+
+def _save_to_csv(result: BacktestResult, filepath: str):
+    """將回測結果的 signal_history 存成 CSV"""
+    if result.signal_history.empty:
+        return
+    
+    df_out = result.signal_history.copy()
+    # date 轉字串
+    if not df_out.empty and "date" in df_out.columns:
+        df_out["date"] = df_out["date"].dt.strftime("%Y-%m-%d")
+    
+    # 確保欄位順序
+    cols = ["date", "price", "high", "low",
+            "MA_5", "MA_10", "MA_20", "MA_60",
+            "pe_ratio", "PE_Percentile", "pb_ratio", "PB_Percentile",
+            "Inst_Net", "dividend_yield",
+            "agg_low", "agg_high",
+            "cons_low", "cons_high",
+            "price_in_range",
+            "short_term_score", "short_term_signal",
+            "swing_score", "swing_signal",
+            "value_score", "value_signal",
+            "dividend_score", "dividend_signal",
+            "composite_signal"]
+    exist_cols = [c for c in cols if c in df_out.columns]
+    
+    df_out.to_csv(filepath, index=False, encoding="utf-8-sig", 
+                  columns=exist_cols)
+
+
+# ============================================================
+# 買賣訊號解析（內部函數）
+# ============================================================
 
 def _parse_trades(
     hist_df: pd.DataFrame,
@@ -228,13 +424,11 @@ def _parse_trades(
             score = 0
         
         if not holding:
-            # 尋找買入點
             if score >= buy_threshold:
                 holding = True
                 entry_price = row.get("close", np.nan)
                 entry_date = row["date"]
         else:
-            # 尋找賣出點
             if score < sell_threshold:
                 holding = False
                 exit_price = row.get("close", np.nan)
@@ -252,7 +446,6 @@ def _parse_trades(
                     return_pct=round(ret, 2),
                 ))
     
-    # 若最後一筆仍在持有中
     if holding:
         last_row = hist_df.iloc[-1]
         last_price = last_row.get("close", np.nan)
@@ -282,35 +475,32 @@ def _parse_composite_trades(
     """
     解析綜合策略的買賣訊號
     
-    買入：任一風格分數 ≥ buy_threshold
+    買入：≥2 種風格分數 ≥ buy_threshold
     賣出：≥2 種風格分數 < sell_threshold
     成本：加權平均
     """
     trades = []
     holding = False
-    total_shares = 0.0   # 虛擬股數（僅供加權平均成本計算）
-    total_cost = 0.0      # 總成本（價格 × 股數）
+    total_shares = 0.0
+    total_cost = 0.0
     entry_date = None
     style_keys = list(style_scores.keys())
     
     for i, row in hist_df.iterrows():
-        # 取得各風格分數
         scores = {}
         for style in style_keys:
             score = row.get(style_scores[style], 0)
             scores[style] = 0 if pd.isna(score) else score
         
         if not holding:
-            # 綜合買入條件：任一風格 ≥ threshold
-            if any(s >= buy_threshold for s in scores.values()):
+            buy_count = sum(1 for s in scores.values() if s >= buy_threshold)
+            if buy_count >= 2:
                 holding = True
                 entry_price = row.get("close", np.nan)
                 entry_date = row["date"]
-                # 初始化加權平均
                 total_shares = 1.0
                 total_cost = entry_price * total_shares
         else:
-            # 綜合賣出條件：≥2 種風格 < threshold
             sell_count = sum(1 for s in scores.values() if s < sell_threshold)
             if sell_count >= 2:
                 holding = False
@@ -331,12 +521,7 @@ def _parse_composite_trades(
                 ))
                 total_shares = 0.0
                 total_cost = 0.0
-            else:
-                # 檢查是否有加碼訊號（其他風格也觸發買入，視為加碼）
-                # 任何風格仍 ≥ buy_threshold 就繼續持有
-                pass
     
-    # 最後若仍在持有
     if holding and total_shares > 0:
         last_row = hist_df.iloc[-1]
         last_price = last_row.get("close", np.nan)
@@ -358,18 +543,17 @@ def _parse_composite_trades(
     return trades
 
 
+# ============================================================
+# 績效計算
+# ============================================================
+
 def _calc_total_return(trades: List[TradeRecord]) -> float:
-    """計算總報酬率
-    - 有已出清交易：取已出清交易平均報酬率
-    - 只有持有中交易：取最後一筆持有中交易的未實現報酬率
-    - 無交易：0%
-    """
+    """計算總報酬率"""
     closed = [t for t in trades if t.status == "已出清"]
     if closed:
         total = sum(t.return_pct for t in closed)
         avg = total / len(closed)
         return round(avg, 2)
-    # 只有持有中交易：取最後一筆的未實現報酬
     holding = [t for t in trades if t.status == "持有中"]
     if holding:
         return round(holding[-1].return_pct, 2)
@@ -377,7 +561,7 @@ def _calc_total_return(trades: List[TradeRecord]) -> float:
 
 
 def _calc_win_rate(trades: List[TradeRecord]) -> float:
-    """計算勝率（已出清交易的獲利比例），無已出清交易時回傳 None"""
+    """計算勝率，無已出清交易時回傳 None"""
     closed = [t for t in trades if t.status == "已出清"]
     if not closed:
         return None
@@ -385,5 +569,35 @@ def _calc_win_rate(trades: List[TradeRecord]) -> float:
     return round(wins / len(closed) * 100, 1)
 
 
+# ============================================================
+# 命令列輔助
+# ============================================================
+
+def print_summary(result: BacktestResult):
+    """印出回測摘要"""
+    buy_sell = f"買≥{result.buy_threshold}/賣<{result.sell_threshold}"
+    strategy_label = {
+        "active": f"積極({buy_sell})",
+        "conservative": f"保守({buy_sell})",
+    }.get(result.strategy, f"{result.strategy}({buy_sell})")
+    
+    print(f"\n{'='*60}")
+    print(f"📊 {result.stock_id} | {strategy_label}")
+    print(f"   區間: {result.start_date} ~ {result.end_date}")
+    print(f"{'='*60}")
+    
+    for sk, sc in [("short_term", "短線"), ("swing", "波段"),
+                   ("value", "價值"), ("dividend", "定存"), ("composite", "綜合")]:
+        info = result.styles[sk]
+        count = info["trade_count"]
+        ret = info["total_return_pct"]
+        wr = info["win_rate"]
+        wr_str = f"{wr:.1f}%" if wr is not None else "N/A"
+        print(f"  {sc}: {count}筆交易 | 報酬 {ret:+.2f}% | 勝率 {wr_str}")
+
+
 if __name__ == "__main__":
-    print("backtest.py v1.0 - 回測分析模組完成")
+    print("backtest.py — 回測分析模組完成")
+    print("  可用函數:")
+    print("    run_backtest(df, stock_id, ...) — 單一回測")
+    print("    run_dual_backtest(df, stock_id, ..., output_dir=...) — 同時跑積極+保守")

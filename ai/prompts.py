@@ -205,9 +205,10 @@ def build_user_message(
     has_position: bool = False,
     avg_price: float = 0.0,
     shares: int = 0,
+    trade_advice: object = None,
 ) -> str:
     """
-    建構使用者訊息（含 v4.2 新指標，皆以中文解釋呈現）
+    建構使用者訊息（含 v4.2 新指標 + 持倉判斷，皆以中文解釋呈現）
     """
     msg = f"請解說股票 {stock_id} {stock_name}\n\n"
     
@@ -266,6 +267,31 @@ def build_user_message(
         msg += f"- 持有股數: {shares} 股\n"
         msg += f"- 平均成本: {avg_price} 元\n"
         msg += "(僅供參考，不影響評分解說)\n"
+    
+    # 持倉判斷（trade_advice）
+    if trade_advice is not None:
+        ta = trade_advice
+        msg += "\n【系統持倉判斷】\n"
+        msg += f"- 動作: {ta.action}\n"
+        msg += f"- 認領風格: {ta.style}\n"
+        msg += f"- 風險等級: {ta.risk_level}\n"
+        msg += f"- 判斷理由: {ta.reason}\n"
+        if ta.current_price is not None:
+            msg += f"- 最新收盤價: {ta.current_price}\n"
+        # 雙軌建議價（附交易方式說明）
+        agg = getattr(ta, 'agg_entry', None)
+        cons = getattr(ta, 'cons_entry', None)
+        if agg is not None and ta.current_price is not None:
+            if agg > ta.current_price:
+                msg += f"- 積極型目標價: {ta.agg_entry_low}~{ta.agg_entry_high} 元（核心 {agg} 元，高於現價，等站回5MA再考慮進場）\n"
+            else:
+                msg += f"- 積極型建議價: {ta.agg_entry_low}~{ta.agg_entry_high} 元（核心 {agg} 元）\n"
+        if cons is not None and ta.current_price is not None:
+            if cons > ta.current_price:
+                msg += f"- 保守型目標價: {ta.cons_entry_low}~{ta.cons_entry_high} 元（核心 {cons} 元，高於現價，需掛單等拉回）\n"
+            else:
+                msg += f"- 保守型建議價: {ta.cons_entry_low}~{ta.cons_entry_high} 元（核心 {cons} 元）\n"
+        msg += "(AI 解說應與持倉判斷保持一致，不可矛盾)\n"
     
     return msg
 

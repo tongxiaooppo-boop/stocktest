@@ -1,75 +1,6 @@
 """
-core/scorer.py v5.1
+core/scorer.py
 四種風格打分 — 五級評分制 + 回測功能
-
-四維評分權重總覽（請以 scoring_config.py 為準）
-
-一、短線風格 (short_term) —— 權重合計 100%
-  trend_structure (趨勢結構)  20%  ← 均線排列(60%) + 站上均線數(40%)
-  momentum        (動能強度)  20%  ← RSI(40%) + MACD(35%) + 突破前高(25%)
-  volume          (成交量結構) 20%  ← Volume Ratio(60%) + 爆量幅度(40%)
-  institutional   (法人籌碼)  15%  ← 5日法人(35%) + 10日法人(25%) + 外資(25%) + 投信(15%)
-  chip            (籌碼健康)  15%  ← 融資(40%) + 融券(30%) + 借券(30%) [反向]
-  risk            (波動風險)  10%  ← 乖離率(40%) + ATR(30%) + RSI過熱(30%) [反向]
-  ★ 額外調整：Risk Modifier (RSI過熱扣分門檻88、負債過高扣分)
-  ★ v5.1：RSI過熱門檻放寬 80→88；多頭排列時動態放寬至 95
-
-二、波段風格 (swing) —— 權重合計 100%
-  revenue_momentum    (營收動能)  25%
-  mid_trend           (中期趨勢)  20%
-  institutional_trend (籌碼趨勢)  20%
-  earnings_growth     (獲利成長)  15%
-  valuation           (估值位置)  10%  ← PE_Percentile(60%) + PB_Percentile(40%) [反向]
-  catalyst            (催化因子)  10%
-  ★ 額外調整：Risk Modifier + 流血去庫存質檢(打8折) + CAGR子權重調整
-
-三、價值風格 (value) —— 權重合計 100%
-  valuation_safety    (估值安全)  15%  ← PE_Percentile(60%) + PB_Percentile(40%) [反向]
-  profit_quality      (獲利品質)  20%  ← ROE(45%) + ROA(25%) + 毛利率(30%)
-  growth_ability      (成長能力)  30%  ← v5.1:原20%,吸收估值釋出權重
-  financial_safety    (財務安全)  15%  ← 負債比(60%) + 流動比率(40%) [反向]
-  cash_flow_quality   (現金流品質) 10%
-  shareholder_return  (股東報酬)  10%
-  ★ v5.1：valuation_safety 25%→15%, growth_ability 20%→30%
-  ★ 額外調整：Data Quality Modifier + Risk Modifier + 產業去偏誤(打85折)
-  ★ 金融業防錯：負債比/現金流直接給滿分
-
-四、定存風格 (dividend) —— 權重合計 100%
-  dividend_record     (配息紀錄)  25%  ← 連續配息年數
-  dividend_quality    (配息品質)  20%  ← 配息率(60%) + EPS Cover(40%)
-  cash_flow           (現金流)   20%  ← FCF覆蓋率
-  financial_safety    (財務安全)  15%  ← 負債比(60%) + 利息保障倍數(40%) [反向]
-  profit_stability    (獲利穩定)  10%  ← ROE波動(50%) + EPS波動(50%) [反向]
-  long_term_growth    (長期成長)  10%  ← Revenue CAGR(50%) + EPS YoY(50%)
-  ★ 額外調整：Data Quality Modifier + Risk Modifier + 產業去偏誤(打85折)
-  ★ 金融業防錯：負債比直接給滿分
-
-通用規則
-- 五級評分：Excellent=100, Good=80, Normal=60, Weak=30, Poor=0
-- 反向評分：數值越低越好（用於負債比、波動、百分位）
-- Risk Modifier：計算子項加權後，額外加減分（±10~15分）
-- Data Quality Modifier：依資料年數打0.70~1.00折
-- 流血去庫存質檢：營益率年減>2pp時，短線/波段打8折
-- 產業去偏誤：負債比>同業中位數×1.2時，價值/定存打85折
-- v5.1 金融業防錯：金融股跳過負債比/營業現金流評分，直接給基準滿分
-
-v5.0 新增：
-- get_all_scores() 加入 start_date / end_date 參數
-- 新增 get_historical_scores()：walk-forward 歷史回測評分，避免 look-ahead bias
-- 新增 _compute_percentile_in_window()：在滾動視窗內重新計算百分位，保證前瞻無偏
-
-v5.1 新增：
-- 金融業防錯模組（is_finance + 3處guard clause）
-- 價值風格估值權重從25%調降至15%，加給成長能力(20%→30%)
-- RSI過熱門檻放寬至88（原80）
-- ★ 四維權重總覽註解
-
-v4.0 重大改版：
-- 所有子項改為五級評分（Excellent=100%, Good=80%, Normal=60%, Weak=30%, Poor=0%）
-- 四種風格各有 6 個子項
-- 新增 Data Quality Modifier（資料年數調整）
-- 新增 Risk Modifier（Penalty/Bonus 機制）
-- 每個子項都輸出 breakdown 供前端顯示
 """
 
 import pandas as pd
@@ -87,10 +18,10 @@ from core.scoring_config import (
 )
 
 # ============================================================
-# v5.1 新增：金融業防錯與短線過熱放寬
+# 金融業防錯與短線過熱放寬
 # ============================================================
 
-# RSI 過熱扣分門檻（原 80，v5.1 放寬至 88 減少強勢股誤殺）
+# RSI 過熱扣分門檻（原 80，放寬至 88 減少強勢股誤殺）
 RSI_OVERHEAT_THRESHOLD = 88
 RSI_OVERHEAT_PENALTY = -10
 
@@ -114,11 +45,19 @@ def is_finance(row: dict) -> bool:
         industry = row.get("industry_category", None)
     if isinstance(industry, str) and industry in FINANCE_SECTORS:
         return True
+    
+    # stock_id 可能為 int/float（2881.0）或 str，需強制轉型避免漏判
     stock_id = row.get("stock_id", None)
-    if isinstance(stock_id, str) and stock_id in FINANCE_STOCK_IDS:
-        return True
-    if isinstance(stock_id, str) and stock_id.startswith("28") and len(stock_id) == 4:
-        return True  # 2xxx 開頭四位數為金融保險類股
+    if stock_id is not None and not pd.isna(stock_id):
+        # 強制轉為純數字字串，過濾 2881.0 等 FinMind 髒資料
+        if isinstance(stock_id, (int, float)):
+            stock_id_str = str(int(float(stock_id)))
+        else:
+            stock_id_str = str(stock_id).strip()
+        if stock_id_str in FINANCE_STOCK_IDS:
+            return True
+        if stock_id_str.startswith("28") and len(stock_id_str) == 4:
+            return True  # 2xxx 開頭四位數為金融保險類股
     return False
 
 
@@ -203,7 +142,6 @@ def apply_risk_modifier(row, base_score, style):
     """
     計算 Risk Modifier（Penalty + Bonus）
     
-    v5.1：
     - RSI 過熱門檻放寬至 88（原 80），減少強勢股誤殺
     - 金融業跳過負債過高與營業現金流的扣分
     
@@ -349,7 +287,7 @@ def score_momentum(row) -> dict:
     
     # 突破前高（門檻讀取 config）
     high_20d = row.get("High_20D", None)
-    if high_20d is None and "close" in row.index:
+    if high_20d is None and "close" in row:
         # 如果沒有 High_20D，嘗試用 rolling max 計算
         pass
     if pd.notna(high_20d) and pd.notna(close):
@@ -2093,4 +2031,4 @@ def get_historical_scores(
 
 
 if __name__ == "__main__":
-    print("scorer.py v5.0 - 五級評分制 + 回測功能完成")
+    print("scorer.py — 五級評分制 + 回測功能")

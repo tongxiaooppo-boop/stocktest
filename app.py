@@ -1,5 +1,5 @@
 """
-台股AI個人化決策系統 v3.1
+台股AI個人化決策系統 v1.0
 Streamlit 前端主入口 — 串接真實資料 + 圖表
 
 瀑布流顯示順序：
@@ -151,13 +151,13 @@ def cn(val: str) -> str:
     return FIELD_CN_MAP.get(val, val)
 
 st.set_page_config(
-    page_title="台股AI個人化決策系統 v3.1",
+    page_title="台股AI個人化決策系統 v1.0",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("📈 台股AI個人化決策系統 v3.1")
+st.title("📈 台股AI個人化決策系統 v1.0")
 st.caption("⚠️ 免責聲明：本系統僅供個人分析參考，不構成任何投資建議或推薦。使用者應自行審慎評估，投資有盈虧風險，請自負責任。")
 st.markdown("---")
 
@@ -166,15 +166,39 @@ with st.sidebar:
     st.header("⚙️ 設定")
     
     st.subheader("🔑 API 金鑰")
+    
+    # FinMind Token
+    with st.expander("📘 點我查看 FinMind 申請教學", expanded=False):
+        st.markdown("""
+        **FinMind API Token（必填）**
+        1. 打開 [FinMind](https://finmindtrade.com) 官網
+        2. 點右上角 **Login / Register** → 用 Email 註冊
+        3. 登入後進 **Dashboard** → 左邊 **API Token**
+        4. 複製那串 Token（長這樣：`eyJ0eXAiOiJKV1Qi...`）
+        5. 貼到下面的輸入框
+        """)
     finmind_token = st.text_input(
-        "FinMind API Token",
+        "FinMind API Token (必填)",
         type="password",
-        help="請輸入您的 FinMind API Token（免費申請：https://finmindtrade.com）",
+        placeholder="eyJ0eXAiOiJKV1Qi...",
     )
+    
+    st.markdown("---")
+    
+    # DeepSeek Key
+    with st.expander("🤖 點我查看 DeepSeek 申請教學", expanded=False):
+        st.markdown("""
+        **DeepSeek API Key（選填）**
+        1. 打開 [DeepSeek Platform](https://platform.deepseek.com) 註冊
+        2. 登入後點左邊 **API Keys**
+        3. 點 **Create API key** → 取名（如 `stock-analyzer`）
+        4. 複製 Key 貼到下面的輸入框
+        > 沒填也能分析，只是沒 AI 解說
+        """)
     deepseek_api_key = st.text_input(
-        "DeepSeek API Key",
+        "DeepSeek API Key (選填)",
         type="password",
-        help="請輸入您的 DeepSeek API Key",
+        placeholder="不填也能分析，只是沒 AI 解說",
     )
     
     st.markdown("---")
@@ -195,19 +219,30 @@ with st.sidebar:
     backtest_btn = st.button("📊 回測分析", type="secondary", use_container_width=True)
 
 # ===== 追蹤按鈕點擊事件 =====
+cache_key = f"cache_{stock_id}"
+
 if backtest_btn:
-    cache_key = f"cache_{stock_id}"
     if cache_key in st.session_state:
         st.session_state["run_backtest"] = True
+        # 點擊回測後自動跳到 tab3
+        st.session_state["_active_tab"] = 2
     else:
         st.session_state["run_backtest"] = False
 
-# ===== 主畫面：檢查是否該開始分析 =====
-cache_key = f"cache_{stock_id}"
-has_cache = cache_key in st.session_state
+# 透過 session_state 記錄分析完成狀態，避免 rerun 時閃過提示文字
+if analyze_btn:
+    st.session_state["_analysis_requested"] = True
+    st.session_state["_active_tab"] = 0
 
-if has_cache:
+# ===== 主畫面：檢查是否該開始分析 =====
+_has_cache = cache_key in st.session_state
+_analysis_done = st.session_state.get("_analysis_requested", False) or _has_cache
+
+if _has_cache:
     # 快取存在，跳過分析流程，直接顯示
+    pass
+elif _analysis_done:
+    # 曾按過分析但快取被清除（極少數狀況），不顯示提示
     pass
 elif backtest_btn:
     # 按了回測但尚未分析過
@@ -256,30 +291,42 @@ try:
     
     if _has_cache:
         cache = st.session_state[cache_key]
-        base = cache["base"]
-        fetch_info = cache["fetch_info"]
-        scores = cache["scores"]
-        advice = cache["advice"]
-        trade_advice = cache.get("trade_advice", None)
-        ai_result = cache.get("ai_result", None)
-        stock_name = cache.get("stock_name", stock_id)
-        df_taiex = cache.get("df_taiex", None)
-        df_info = cache.get("df_info", None)
-        df_rev = cache.get("df_rev", None)
-        df_fin = cache.get("df_fin", None)
-        df_bal = cache.get("df_bal", None)
-        df_cf = cache.get("df_cf", None)
-        df_div = cache.get("df_div", None)
-        df_price = cache.get("df_price", None)
-        df_per = cache.get("df_per", None)
-        df_inst = cache.get("df_inst", None)
-        df_margin = cache.get("df_margin", None)
-        df_ss = cache.get("df_ss", None)
         
-        # 跳過撈取，直接顯示
-        progress_bar.empty()
-        status_text.empty()
-    else:
+        # 檢查快取中的 trade_advice 是否為舊版（缺 v4.4 雙軌欄位）
+        old_ta = cache.get("trade_advice", None)
+        if old_ta is not None and not hasattr(old_ta, 'agg_entry'):
+            # 舊版快取，清除後強制重新分析
+            del st.session_state[cache_key]
+            st.session_state["analyzed"] = False
+            st.info("🔄 偵測到舊版快取，正在重新分析以啟用雙軌建議價功能...")
+            _has_cache = False  # 讓程式碼落入下方的 else 重新分析
+        
+        if _has_cache:
+            base = cache["base"]
+            fetch_info = cache["fetch_info"]
+            scores = cache["scores"]
+            advice = cache["advice"]
+            trade_advice = cache.get("trade_advice", None)
+            ai_result = cache.get("ai_result", None)
+            stock_name = cache.get("stock_name", stock_id)
+            df_taiex = cache.get("df_taiex", None)
+            df_info = cache.get("df_info", None)
+            df_rev = cache.get("df_rev", None)
+            df_fin = cache.get("df_fin", None)
+            df_bal = cache.get("df_bal", None)
+            df_cf = cache.get("df_cf", None)
+            df_div = cache.get("df_div", None)
+            df_price = cache.get("df_price", None)
+            df_per = cache.get("df_per", None)
+            df_inst = cache.get("df_inst", None)
+            df_margin = cache.get("df_margin", None)
+            df_ss = cache.get("df_ss", None)
+            
+            # 跳過撈取，直接顯示
+            progress_bar.empty()
+            status_text.empty()
+    
+    if not _has_cache:
         # ===== 第 1 段：📥 撈取資料 (0-30%) =====
         update_progress(5, "📥 [1/5] 撈取股價資料（3年，足夠計算 Debt_Ratio_Trend/EPS_YoY）...")
         df_price = fetch_stock_price(stock_id, start_3y, end_str, finmind_token)
@@ -377,6 +424,7 @@ try:
                 avg_price=avg_price,
                 shares=shares,
                 api_key=deepseek_api_key,
+                trade_advice=trade_advice,
             )
         else:
             update_progress(95, "🤖 [5/5] 未設定 API Key，跳過 AI 解說")
@@ -493,36 +541,39 @@ try:
         tab1, tab2, tab3 = st.tabs(["短線面", "中長線面", "📊 回測分析"])
         
         with tab1:
-            st.markdown("**短線面圖表**")
+            st.markdown("**短線面圖表（近 1 個月）**")
+            
+            # 過濾近 1 個月資料（約 21 個交易日）
+            base_short = base.tail(21).copy()
             
             # 圖表 1: K線 + 均線
             fig1, axes = plt.subplots(3, 1, figsize=(12, 10), gridspec_kw={'height_ratios': [3, 1, 1]})
             
             # 子圖 1: 股價 + 均線
             ax1 = axes[0]
-            if "close" in base.columns:
-                ax1.plot(base["date"], base["close"], label="收盤價", color="black", linewidth=1.5)
+            if "close" in base_short.columns:
+                ax1.plot(base_short["date"], base_short["close"], label="收盤價", color="black", linewidth=1.5)
                 for ma, color, style in [("MA_5", "red", "--"), ("MA_10", "orange", "--"), ("MA_20", "blue", "--")]:
-                    if ma in base.columns:
-                        ax1.plot(base["date"], base[ma], label=ma, color=color, linestyle=style, linewidth=1)
-            ax1.set_title(f"{stock_id} {stock_name} - 股價與均線")
+                    if ma in base_short.columns:
+                        ax1.plot(base_short["date"], base_short[ma], label=ma, color=color, linestyle=style, linewidth=1)
+            ax1.set_title(f"{stock_id} {stock_name} - 股價與均線（近1個月）")
             ax1.set_ylabel("價格")
             ax1.legend(loc="best")
             ax1.grid(True, alpha=0.3)
             
             # 子圖 2: 成交量
             ax2 = axes[1]
-            if "volume" in base.columns:
-                colors = ["red" if base["close"].iloc[i] >= base["open"].iloc[i] else "green" 
-                         for i in range(len(base))] if "open" in base.columns else ["blue"] * len(base)
-                ax2.bar(base["date"], base["volume"], color=colors, alpha=0.6, width=1)
+            if "volume" in base_short.columns:
+                colors = ["red" if base_short["close"].iloc[i] >= base_short["open"].iloc[i] else "green" 
+                         for i in range(len(base_short))] if "open" in base_short.columns else ["blue"] * len(base_short)
+                ax2.bar(base_short["date"], base_short["volume"], color=colors, alpha=0.6, width=1)
             ax2.set_ylabel("成交量")
             ax2.grid(True, alpha=0.3)
             
             # 子圖 3: RSI
             ax3 = axes[2]
-            if "RSI_6" in base.columns:
-                ax3.plot(base["date"], base["RSI_6"], label="RSI(6)", color="purple", linewidth=1.5)
+            if "RSI_6" in base_short.columns:
+                ax3.plot(base_short["date"], base_short["RSI_6"], label="RSI(6)", color="purple", linewidth=1.5)
                 ax3.axhline(y=80, color="red", linestyle="--", alpha=0.5, label="超買(80)")
                 ax3.axhline(y=20, color="green", linestyle="--", alpha=0.5, label="超賣(20)")
             ax3.set_ylabel("RSI")
@@ -549,27 +600,39 @@ try:
             
             st.markdown("---")
             
-            # 圖表 2: 法人買賣超 + 融資券
+            # 圖表 2: 法人買賣超 + 股價（近 1 個月）
             fig2, axes2 = plt.subplots(2, 1, figsize=(12, 7))
             
             ax_inst = axes2[0]
             inst_daily = {"Foreign_Net": "外資", "Trust_Net": "投信", "Dealer_Net": "自營商"}
             for col, label in inst_daily.items():
-                if col in base.columns:
-                    ax_inst.bar(base["date"], base[col], label=label, alpha=0.6, width=1)
-            ax_inst.set_title("三大法人買賣超（每日）")
+                if col in base_short.columns:
+                    ax_inst.bar(base_short["date"], base_short[col], label=label, alpha=0.6, width=1)
+            # 疊加股價線（右軸）
+            if "close" in base_short.columns:
+                ax_inst_price = ax_inst.twinx()
+                ax_inst_price.plot(base_short["date"], base_short["close"], label="收盤價", color="black", linewidth=1.5, linestyle="-")
+                ax_inst_price.set_ylabel("股價")
+                ax_inst_price.legend(loc="upper right")
+            ax_inst.set_title("三大法人買賣超 + 股價（每日，近1個月）")
             ax_inst.set_ylabel("買賣超")
-            ax_inst.legend(loc="best")
+            ax_inst.legend(loc="upper left")
             ax_inst.grid(True, alpha=0.3)
             
             ax_margin = axes2[1]
-            if "Margin_5D_Change" in base.columns:
-                ax_margin.bar(base["date"], base["Margin_5D_Change"], label="融資5日變化", alpha=0.6, width=1, color="orange")
-            if "Short_5D_Change" in base.columns:
-                ax_margin.bar(base["date"], base["Short_5D_Change"], label="融券5日變化", alpha=0.6, width=1, color="purple")
-            ax_margin.set_title("融資券5日變化")
+            if "Margin_5D_Change" in base_short.columns:
+                ax_margin.bar(base_short["date"], base_short["Margin_5D_Change"], label="融資5日變化", alpha=0.6, width=1, color="orange")
+            if "Short_5D_Change" in base_short.columns:
+                ax_margin.bar(base_short["date"], base_short["Short_5D_Change"], label="融券5日變化", alpha=0.6, width=1, color="purple")
+            # 疊加股價線（右軸）
+            if "close" in base_short.columns:
+                ax_margin_price = ax_margin.twinx()
+                ax_margin_price.plot(base_short["date"], base_short["close"], label="收盤價", color="black", linewidth=1.5, linestyle="-")
+                ax_margin_price.set_ylabel("股價")
+                ax_margin_price.legend(loc="upper right")
+            ax_margin.set_title("融資券5日變化 + 股價（近1個月）")
             ax_margin.set_ylabel("變化量")
-            ax_margin.legend(loc="best")
+            ax_margin.legend(loc="upper left")
             ax_margin.grid(True, alpha=0.3)
             
             plt.tight_layout()
@@ -593,198 +656,249 @@ try:
                 st.dataframe(df_chip, use_container_width=True, hide_index=True)
         
         with tab2:
-            # 計算各資料的實際年數（動態顯示）
-            fin_years = 0
-            if df_fin is not None and not df_fin.empty and "date" in df_fin.columns:
-                fin_dates = pd.to_datetime(df_fin["date"])
-                fin_years = round((fin_dates.max() - fin_dates.min()).days / 365.25)
-            rev_years = 0
-            if df_rev is not None and not df_rev.empty and "date" in df_rev.columns:
-                rev_dates = pd.to_datetime(df_rev["date"])
-                rev_years = round((rev_dates.max() - rev_dates.min()).days / 365.25)
-            div_years = 0
-            if df_div is not None and not df_div.empty and "year" in df_div.columns:
-                div_years = df_div["year"].nunique()
+            # 中長線 → 依三種評分風格權重最高的維度分 tab
+            tab2a, tab2b, tab2c = st.tabs(["🟠 波段動能 (營收+趨勢+籌碼)", "🔵 價值成長 (ROE+EPS+毛利率)", "🟢 定存安全 (股利+負債+PE/PB)"])
             
-            st.markdown(f"**中長線面圖表（財報 {fin_years} 年、營收 {rev_years} 年、股利 {div_years} 年）**")
-            
-            # 從原始財報資料建構 10 年財務圖表
+            # ---- 先建好共用的 df_fin_pivot ----
             fin_raw_list = []
             for df_fin_raw in [df_fin, df_bal, df_cf]:
                 if df_fin_raw is not None and not df_fin_raw.empty:
                     fin_raw_list.append(df_fin_raw)
-            
+            df_fin_pivot = None
             if fin_raw_list:
                 df_fin_all = pd.concat(fin_raw_list, ignore_index=True)
                 df_fin_pivot = _pivot_financial_statements(df_fin_all)
-                
-                if not df_fin_pivot.empty:
+                if df_fin_pivot is not None and not df_fin_pivot.empty:
                     df_fin_pivot = df_fin_pivot.sort_values("date")
-                    
                     if "EPS" in df_fin_pivot.columns:
                         df_fin_pivot["TTM_EPS"] = df_fin_pivot["EPS"].rolling(window=4, min_periods=4).sum()
-                    
                     if "IncomeAfterTaxes" in df_fin_pivot.columns and "Equity" in df_fin_pivot.columns:
                         df_fin_pivot["TTM_NetIncome"] = df_fin_pivot["IncomeAfterTaxes"].rolling(window=4, min_periods=4).sum()
                         df_fin_pivot["ROE_TTM"] = (df_fin_pivot["TTM_NetIncome"] / df_fin_pivot["Equity"].replace(0, np.nan)) * 100
-                    
                     if "GrossProfit" in df_fin_pivot.columns and "Revenue" in df_fin_pivot.columns:
                         df_fin_pivot["Gross_Margin"] = (df_fin_pivot["GrossProfit"] / df_fin_pivot["Revenue"].replace(0, np.nan)) * 100
-                    
-                    if "OperatingIncome" in df_fin_pivot.columns and "Revenue" in df_fin_pivot.columns:
-                        df_fin_pivot["Operating_Margin"] = (df_fin_pivot["OperatingIncome"] / df_fin_pivot["Revenue"].replace(0, np.nan)) * 100
-                    
                     if "Liabilities" in df_fin_pivot.columns and "TotalAssets" in df_fin_pivot.columns:
                         df_fin_pivot["Debt_Ratio"] = (df_fin_pivot["Liabilities"] / df_fin_pivot["TotalAssets"].replace(0, np.nan)) * 100
-                    
                     if "CashFlowsFromOperatingActivities" in df_fin_pivot.columns and "PropertyAndPlantAndEquipment" in df_fin_pivot.columns:
                         df_fin_pivot["TTM_OperatingCF"] = df_fin_pivot["CashFlowsFromOperatingActivities"].rolling(window=4, min_periods=4).sum()
                         df_fin_pivot["TTM_CAPEX"] = df_fin_pivot["PropertyAndPlantAndEquipment"].rolling(window=4, min_periods=4).sum()
                         df_fin_pivot["TTM_FCF"] = df_fin_pivot["TTM_OperatingCF"] - df_fin_pivot["TTM_CAPEX"]
-                    
-                    # 圖表 3: ROE / 毛利率 / 營益率（10年）
-                    fig3, ax3 = plt.subplots(figsize=(12, 5))
-                    fin_chart_cols = {"ROE_TTM": "ROE", "Gross_Margin": "毛利率", "Operating_Margin": "營益率"}
-                    for col, label in fin_chart_cols.items():
+            
+            # ===== tab2a: 波段動能（權重合計 65%） =====
+            with tab2a:
+                st.markdown("**波段評分權重最高：營收動能 25% + 中期趨勢 20% + 籌碼趨勢 20%**")
+                
+                # 圖表 1: 營收 YoY（從母表，約 1 年區間，日頻走勢）
+                fig_sw1, ax_sw1 = plt.subplots(figsize=(12, 4))
+                if "Revenue_YoY" in base.columns:
+                    ax_sw1.plot(base["date"], base["Revenue_YoY"], label="營收 YoY", color="green", linewidth=1.5)
+                    ax_sw1.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+                ax_sw1.set_title(f"{stock_id} {stock_name} - 營收年增率 YoY（權重 25%）")
+                ax_sw1.set_ylabel("YoY (%)")
+                ax_sw1.legend(loc="best")
+                ax_sw1.grid(True, alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig_sw1)
+                plt.close()
+                
+                st.markdown("---")
+                
+                # 圖表 2: 股價 + MA20/MA60（中期趨勢，近 60 日）
+                fig_sw2, ax_sw2 = plt.subplots(figsize=(12, 4))
+                base_sw2 = base.tail(60).copy()
+                if "close" in base_sw2.columns:
+                    ax_sw2.plot(base_sw2["date"], base_sw2["close"], label="收盤價", color="black", linewidth=1.5)
+                for ma, color in [("MA_20", "blue"), ("MA_60", "red")]:
+                    if ma in base_sw2.columns:
+                        ax_sw2.plot(base_sw2["date"], base_sw2[ma], label=ma, color=color, linestyle="--", linewidth=1)
+                ax_sw2.set_title(f"{stock_id} {stock_name} - 股價與中期均線 MA20/MA60（近60日，權重 20%）")
+                ax_sw2.set_ylabel("價格")
+                ax_sw2.legend(loc="best")
+                ax_sw2.grid(True, alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig_sw2)
+                plt.close()
+                
+                st.markdown("---")
+                
+                # 圖表 3: 法人 20 日累計買賣超 + 股價（籌碼趨勢，近 20 日）
+                fig_sw3, ax_sw3 = plt.subplots(figsize=(12, 4))
+                base_sw3 = base.tail(20).copy()
+                if "Inst_20D_Net" in base_sw3.columns:
+                    ax_sw3.bar(base_sw3["date"], base_sw3["Inst_20D_Net"], label="法人20日累計", alpha=0.6, width=1, color="orange")
+                # 疊加股價線（右軸）
+                if "close" in base_sw3.columns:
+                    ax_sw3_price = ax_sw3.twinx()
+                    ax_sw3_price.plot(base_sw3["date"], base_sw3["close"], label="收盤價", color="black", linewidth=1.5, linestyle="-")
+                    ax_sw3_price.set_ylabel("股價")
+                    ax_sw3_price.legend(loc="upper right")
+                ax_sw3.set_title(f"{stock_id} {stock_name} - 法人20日累計買賣超 + 股價（近20日，權重 20%）")
+                ax_sw3.set_ylabel("累計買賣超")
+                ax_sw3.legend(loc="upper left")
+                ax_sw3.grid(True, alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig_sw3)
+                plt.close()
+                
+                # 波段數據表格
+                st.markdown("---")
+                st.markdown("**波段動能數據（最近10筆）**")
+                swing_cols = ["date", "Revenue_YoY", "close", "MA_20", "MA_60", "Inst_20D_Net"]
+                available_sw = [c for c in swing_cols if c in base.columns]
+                if available_sw:
+                    df_sw = base[available_sw].tail(10).copy()
+                    df_sw["date"] = df_sw["date"].dt.strftime("%Y-%m-%d")
+                    for col in df_sw.columns:
+                        if col != "date":
+                            df_sw[col] = df_sw[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "N/A")
+                    df_sw = df_sw.rename(columns=lambda c: f"{cn(c)} ({c})" if c != "date" else c)
+                    st.dataframe(df_sw, use_container_width=True, hide_index=True)
+            
+            # ===== tab2b: 價值成長（權重合計 50%） =====
+            with tab2b:
+                st.markdown("**價值評分權重最高：成長能力 30% + 獲利品質 20%**")
+                
+                if df_fin_pivot is not None and not df_fin_pivot.empty:
+                    # 圖表 1: ROE / 毛利率（獲利品質 20%）
+                    fig_v1, ax_v1 = plt.subplots(figsize=(12, 4))
+                    val_chart1 = {"ROE_TTM": "ROE", "Gross_Margin": "毛利率"}
+                    for col, label in val_chart1.items():
                         if col in df_fin_pivot.columns:
-                            ax3.plot(df_fin_pivot["date"], df_fin_pivot[col], label=label, linewidth=1.5, marker="o", markersize=3)
-                    ax3.set_title(f"{stock_id} {stock_name} - 財務指標（10年）")
-                    ax3.set_ylabel("百分比 (%)")
-                    ax3.legend(loc="best")
-                    ax3.grid(True, alpha=0.3)
+                            ax_v1.plot(df_fin_pivot["date"], df_fin_pivot[col], label=label, linewidth=1.5, marker="o", markersize=3)
+                    ax_v1.set_title(f"{stock_id} {stock_name} - ROE / 毛利率（權重 20%）")
+                    ax_v1.set_ylabel("百分比 (%)")
+                    ax_v1.legend(loc="best")
+                    ax_v1.grid(True, alpha=0.3)
                     plt.tight_layout()
-                    st.pyplot(fig3)
+                    st.pyplot(fig_v1)
                     plt.close()
-                    
-                    st.markdown("**財務指標數據表格（最近20筆）**")
-                    fin_table_cols = ["date"] + [c for c in fin_chart_cols.keys() if c in df_fin_pivot.columns]
-                    if len(fin_table_cols) > 1:
-                        df_fin_table = df_fin_pivot[fin_table_cols].tail(20).copy()
-                        df_fin_table["date"] = df_fin_table["date"].dt.strftime("%Y-%m-%d")
-                        for col in df_fin_table.columns:
-                            if col != "date":
-                                df_fin_table[col] = df_fin_table[col].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A")
-                        df_fin_table = df_fin_table.rename(columns=lambda c: f"{cn(c)} ({c})" if c != "date" else c)
-                        st.dataframe(df_fin_table, use_container_width=True, hide_index=True)
                     
                     st.markdown("---")
                     
-                    # 圖表 4: EPS / 營收 YoY（10年）
-                    fig4, ax4_1 = plt.subplots(figsize=(12, 5))
-                    ax4_2 = ax4_1.twinx()
-                    
+                    # 圖表 2: TTM EPS + 營收YoY（成長能力 30%）
+                    fig_v2, ax_v2_1 = plt.subplots(figsize=(12, 4))
+                    ax_v2_2 = ax_v2_1.twinx()
                     if "TTM_EPS" in df_fin_pivot.columns:
-                        ax4_1.plot(df_fin_pivot["date"], df_fin_pivot["TTM_EPS"], label="TTM EPS", color="blue", linewidth=1.5, marker="o", markersize=3)
-                    if df_rev is not None and not df_rev.empty:
-                        df_rev_chart = df_rev.copy()
-                        df_rev_chart["date"] = pd.to_datetime(df_rev_chart["date"])
-                        df_rev_chart = df_rev_chart.sort_values("date")
-                        df_rev_chart["revenue_year"] = df_rev_chart["revenue_year"].astype(int)
-                        df_rev_chart["revenue_month"] = df_rev_chart["revenue_month"].astype(int)
-                        df_rev_chart["this_year_key"] = df_rev_chart["revenue_year"].astype(str) + "_" + df_rev_chart["revenue_month"].astype(str)
-                        df_rev_chart["last_year_key"] = (df_rev_chart["revenue_year"] - 1).astype(str) + "_" + df_rev_chart["revenue_month"].astype(str)
-                        last_year_rev = df_rev_chart.set_index("this_year_key")["revenue"].to_dict()
-                        df_rev_chart["last_year_revenue"] = df_rev_chart["last_year_key"].map(last_year_rev)
-                        df_rev_chart["Revenue_YoY"] = ((df_rev_chart["revenue"] - df_rev_chart["last_year_revenue"]) / df_rev_chart["last_year_revenue"]) * 100
-                        ax4_2.plot(df_rev_chart["date"], df_rev_chart["Revenue_YoY"], label="營收 YoY", color="green", linewidth=1.5, linestyle="--", marker="s", markersize=3)
-                    
-                    ax4_1.set_ylabel("TTM EPS", color="blue")
-                    ax4_2.set_ylabel("營收 YoY (%)", color="green")
-                    ax4_1.set_title(f"{stock_id} {stock_name} - EPS 與營收成長（10年）")
-                    ax4_1.legend(loc="upper left")
-                    ax4_2.legend(loc="upper right")
-                    ax4_1.grid(True, alpha=0.3)
+                        ax_v2_1.plot(df_fin_pivot["date"], df_fin_pivot["TTM_EPS"], label="TTM EPS", color="blue", linewidth=1.5, marker="o", markersize=3)
+                    ax_v2_1.set_ylabel("TTM EPS", color="blue")
+                    if "Revenue_YoY" in base.columns:
+                        ax_v2_2.plot(base["date"], base["Revenue_YoY"], label="營收 YoY", color="green", linewidth=1.5, linestyle="--")
+                    ax_v2_2.set_ylabel("營收 YoY (%)", color="green")
+                    ax_v2_1.set_title(f"{stock_id} {stock_name} - TTM EPS 與營收成長（權重 30%）")
+                    ax_v2_1.legend(loc="upper left")
+                    ax_v2_2.legend(loc="upper right")
+                    ax_v2_1.grid(True, alpha=0.3)
                     plt.tight_layout()
-                    st.pyplot(fig4)
+                    st.pyplot(fig_v2)
                     plt.close()
                     
+                    # 價值數據表格
                     st.markdown("---")
-                    
-                    # 圖表 5: 自由現金流 / 負債比（10年）
-                    fig5, ax5_1 = plt.subplots(figsize=(12, 5))
-                    ax5_2 = ax5_1.twinx()
-                    
+                    st.markdown("**價值成長數據（最近10筆）**")
+                    val_cols = ["date", "TTM_EPS", "Revenue_YoY", "ROE_TTM", "Gross_Margin"]
+                    available_val_base = [c for c in val_cols if c in base.columns]
+                    if available_val_base:
+                        df_val = base[available_val_base].tail(10).copy()
+                        df_val["date"] = df_val["date"].dt.strftime("%Y-%m-%d")
+                        for col in df_val.columns:
+                            if col != "date":
+                                df_val[col] = df_val[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "N/A")
+                        df_val = df_val.rename(columns=lambda c: f"{cn(c)} ({c})" if c != "date" else c)
+                        st.dataframe(df_val, use_container_width=True, hide_index=True)
+                else:
+                    st.caption("無財報資料")
+            
+            # ===== tab2c: 定存安全（權重合計 65%） =====
+            with tab2c:
+                st.markdown("**定存評分權重最高：配息紀錄 25% + 配息品質 20% + 現金流 20% + 財務安全 15%**")
+                
+                # 圖表 1: 歷年現金股利（配息紀錄 25%）
+                fig_d1, ax_d1 = plt.subplots(figsize=(12, 4))
+                if df_div is not None and not df_div.empty and "CashEarningsDistribution" in df_div.columns:
+                    div_raw = df_div.copy()
+                    if "year" in div_raw.columns:
+                        def _parse_year(val):
+                            if pd.isna(val):
+                                return None
+                            val_str = str(val).strip()
+                            import re
+                            matches = re.findall(r"\d+", val_str)
+                            if not matches:
+                                return None
+                            num = int(matches[0])
+                            return num + 1911 if num <= 150 else num
+                        div_raw["year_num"] = div_raw["year"].apply(_parse_year)
+                        div_raw = div_raw.dropna(subset=["year_num"])
+                        div_raw["year_num"] = div_raw["year_num"].astype(int)
+                        div_raw["cash_total"] = div_raw["CashEarningsDistribution"].fillna(0) + div_raw["CashStatutorySurplus"].fillna(0)
+                        yearly_div = div_raw.groupby("year_num")["cash_total"].sum()
+                        if not yearly_div.empty:
+                            ax_d1.bar(yearly_div.index.astype(str), yearly_div.values, alpha=0.7, color="orange")
+                            ax_d1.set_title(f"{stock_id} {stock_name} - 歷年現金股利（權重 25%）")
+                            ax_d1.set_ylabel("現金股利（元）")
+                            ax_d1.grid(True, alpha=0.3)
+                            for i, (year, val) in enumerate(yearly_div.items()):
+                                ax_d1.text(i, val + 0.1, f"{val:.1f}", ha="center", fontsize=9)
+                plt.tight_layout()
+                st.pyplot(fig_d1)
+                plt.close()
+                
+                st.markdown("---")
+                
+                # 圖表 2: TTM FCF / 負債比（現金流 20% + 財務安全 15%）
+                fig_d2, ax_d2_1 = plt.subplots(figsize=(12, 4))
+                ax_d2_2 = ax_d2_1.twinx()
+                if df_fin_pivot is not None and not df_fin_pivot.empty:
                     if "TTM_FCF" in df_fin_pivot.columns:
-                        ax5_1.bar(df_fin_pivot["date"], df_fin_pivot["TTM_FCF"], label="TTM FCF", alpha=0.6, width=30, color="green")
+                        ax_d2_1.bar(df_fin_pivot["date"], df_fin_pivot["TTM_FCF"], label="TTM FCF", alpha=0.6, width=30, color="green")
                     if "Debt_Ratio" in df_fin_pivot.columns:
-                        ax5_2.plot(df_fin_pivot["date"], df_fin_pivot["Debt_Ratio"], label="負債比", color="red", linewidth=1.5, marker="o", markersize=3)
-                    
-                    ax5_1.set_ylabel("TTM FCF", color="green")
-                    ax5_2.set_ylabel("負債比 (%)", color="red")
-                    ax5_1.set_title(f"{stock_id} {stock_name} - 自由現金流與負債比（10年）")
-                    ax5_1.legend(loc="upper left")
-                    ax5_2.legend(loc="upper right")
-                    ax5_1.grid(True, alpha=0.3)
-                    plt.tight_layout()
-                    st.pyplot(fig5)
-                    plt.close()
-            
-            # 圖表 6: 本益比 / 股價淨值比（從母表，因為本益比是日頻）
-            fig6, ax6_1 = plt.subplots(figsize=(12, 5))
-            ax6_2 = ax6_1.twinx()
-            
-            if "pe_ratio" in base.columns:
-                ax6_1.plot(base["date"], base["pe_ratio"], label="本益比", color="red", linewidth=1.5)
-            if "pb_ratio" in base.columns:
-                ax6_2.plot(base["date"], base["pb_ratio"], label="股價淨值比", color="purple", linewidth=1.5, linestyle="--")
-            
-            ax6_1.set_ylabel("本益比", color="red")
-            ax6_2.set_ylabel("股價淨值比", color="purple")
-            ax6_1.set_title(f"{stock_id} {stock_name} - 本益比與股價淨值比（1年）")
-            ax6_1.legend(loc="upper left")
-            ax6_2.legend(loc="upper right")
-            ax6_1.grid(True, alpha=0.3)
-            plt.tight_layout()
-            st.pyplot(fig6)
-            plt.close()
-            
-            st.markdown("---")
-            
-            # 圖表 7: 歷年現金股利（直接從原始股利資料計算，不受股價範圍限制）
-            fig7, ax7 = plt.subplots(figsize=(12, 4))
-            if df_div is not None and not df_div.empty and "CashEarningsDistribution" in df_div.columns:
-                div_raw = df_div.copy()
-                if "year" in div_raw.columns:
-                    def _parse_year(val):
-                        if pd.isna(val):
-                            return None
-                        val_str = str(val).strip()
-                        import re
-                        matches = re.findall(r"\d+", val_str)
-                        if not matches:
-                            return None
-                        num = int(matches[0])
-                        return num + 1911 if num <= 150 else num
-                    div_raw["year_num"] = div_raw["year"].apply(_parse_year)
-                    div_raw = div_raw.dropna(subset=["year_num"])
-                    div_raw["year_num"] = div_raw["year_num"].astype(int)
-                    div_raw["cash_total"] = div_raw["CashEarningsDistribution"].fillna(0) + div_raw["CashStatutorySurplus"].fillna(0)
-                    yearly_div = div_raw.groupby("year_num")["cash_total"].sum()
-                    if not yearly_div.empty:
-                        ax7.bar(yearly_div.index.astype(str), yearly_div.values, alpha=0.7, color="orange")
-                        ax7.set_title(f"{stock_id} {stock_name} - 歷年現金股利（共 {len(yearly_div)} 年）")
-                        ax7.set_ylabel("現金股利（元）")
-                        ax7.grid(True, alpha=0.3)
-                        for i, (year, val) in enumerate(yearly_div.items()):
-                            ax7.text(i, val + 0.1, f"{val:.1f}", ha="center", fontsize=9)
-            plt.tight_layout()
-            st.pyplot(fig7)
-            plt.close()
-            
-            # 中長線面綜合數據表格
-            st.markdown("**中長線面綜合數據（最近10筆）**")
-            long_cols = ["date", "TTM_EPS", "Revenue_YoY", "pe_ratio", "pb_ratio", "TTM_FCF", "Debt_Ratio"]
-            available_long = [c for c in long_cols if c in base.columns]
-            if available_long:
-                df_long = base[available_long].tail(10).copy()
-                df_long["date"] = df_long["date"].dt.strftime("%Y-%m-%d")
-                for col in df_long.columns:
-                    if col != "date":
-                        df_long[col] = df_long[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "N/A")
-                df_long = df_long.rename(columns=lambda c: f"{cn(c)} ({c})" if c != "date" else c)
-                st.dataframe(df_long, use_container_width=True, hide_index=True)
+                        ax_d2_2.plot(df_fin_pivot["date"], df_fin_pivot["Debt_Ratio"], label="負債比", color="red", linewidth=1.5, marker="o", markersize=3)
+                ax_d2_1.set_ylabel("TTM FCF", color="green")
+                ax_d2_2.set_ylabel("負債比 (%)", color="red")
+                ax_d2_1.set_title(f"{stock_id} {stock_name} - 自由現金流 / 負債比（權重 20%+15%）")
+                ax_d2_1.legend(loc="upper left")
+                ax_d2_2.legend(loc="upper right")
+                ax_d2_1.grid(True, alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig_d2)
+                plt.close()
+                
+                st.markdown("---")
+                
+                # 圖表 3: PE/PB Percentile + 殖利率（估值安全 + 股東報酬）
+                fig_d3, ax_d3_1 = plt.subplots(figsize=(12, 4))
+                ax_d3_2 = ax_d3_1.twinx()
+                if "pe_ratio" in base.columns:
+                    ax_d3_1.plot(base["date"], base["pe_ratio"], label="本益比", color="red", linewidth=1.5)
+                if "pb_ratio" in base.columns:
+                    ax_d3_1.plot(base["date"], base["pb_ratio"], label="股價淨值比", color="purple", linewidth=1.5, linestyle="--")
+                if "dividend_yield" in base.columns:
+                    ax_d3_2.plot(base["date"], base["dividend_yield"], label="殖利率", color="green", linewidth=1.5, linestyle=":")
+                ax_d3_1.set_ylabel("PE / PB", color="red")
+                ax_d3_2.set_ylabel("殖利率 (%)", color="green")
+                ax_d3_1.set_title(f"{stock_id} {stock_name} - 本益比 / 淨值比 / 殖利率")
+                ax_d3_1.legend(loc="upper left")
+                ax_d3_2.legend(loc="upper right")
+                ax_d3_1.grid(True, alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig_d3)
+                plt.close()
+                
+                # 定存數據表格
+                st.markdown("---")
+                st.markdown("**定存安全數據（最近10筆）**")
+                div_cols = ["date", "dividend_yield", "Payout_Ratio", "FCF_Coverage", "Debt_Ratio"]
+                available_div = [c for c in div_cols if c in base.columns]
+                if available_div:
+                    df_div_tbl = base[available_div].tail(10).copy()
+                    df_div_tbl["date"] = df_div_tbl["date"].dt.strftime("%Y-%m-%d")
+                    for col in df_div_tbl.columns:
+                        if col != "date":
+                            df_div_tbl[col] = df_div_tbl[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "N/A")
+                    df_div_tbl = df_div_tbl.rename(columns=lambda c: f"{cn(c)} ({c})" if c != "date" else c)
+                    st.dataframe(df_div_tbl, use_container_width=True, hide_index=True)
     
-        # ===== Tab 3: 📊 回測分析 =====
+        # ===== Tab 3: 📊 回測分析（雙策略：積極+保守） =====
         with tab3:
             st.markdown("**📊 回測分析**")
             
@@ -793,45 +907,94 @@ try:
             else:
                 # === A. 參數設定（摺疊） ===
                 with st.expander("⚙️ 回測參數設定", expanded=False):
-                    bt_start = st.date_input("回測起始日", value=datetime(2026, 1, 1))
+                    bt_start = st.date_input("回測起始日", value=datetime.now() - timedelta(days=365))
                     bt_end = st.date_input("回測結束日", value=datetime.now())
                     bt_freq = st.selectbox("輸出頻率", options=["W", "M", "D"], index=2, format_func=lambda x: {"W": "每週", "M": "每月", "D": "每日"}.get(x, x))
-                    bt_buy = st.slider("買入門檻（分數 ≥ 此值）", 0, 100, 60)
-                    bt_sell = st.slider("賣出門檻（分數 < 此值）", 0, 100, 40)
-                    bt_run = st.button("▶️ 執行回測", type="primary")
+                    st.caption("📌 回測將同時執行積極(買≥60/賣<40)和保守(買≥70/賣<50)兩種策略")
+                    bt_run = st.button("▶️ 執行回測（雙策略）", type="primary")
                 
                 # 清除舊股票的回測殘留
                 if "bt_result" in st.session_state and st.session_state["bt_result"].stock_id != stock_id:
-                    for k in ["bt_result", "_bt_csv_path", "_bt_csv_name"]:
+                    for k in ["bt_result", "bt_active", "bt_conservative", 
+                               "_bt_csv_path_a", "_bt_csv_name_a",
+                               "_bt_csv_path_c", "_bt_csv_name_c", "bt_strategy"]:
                         st.session_state.pop(k, None)
                 
-                # 每次點擊「執行回測」都重新執行（移除 _bt_trigger 鎖定，允許修改邊界後重跑）
+                # 每次點擊「執行回測」都重新執行 — 同時跑積極(70/50)和保守(60/40)
                 if bt_run:
-                    with st.spinner("⏳ 執行回測中（walk-forward 評分）..."):
-                        bt_result = run_backtest(
+                    with st.spinner("⏳ 執行回測中（雙策略：積極 60/40 + 保守 70/50）..."):
+                        bt_active = run_backtest(
                             df=base,
                             stock_id=stock_id,
                             start_date=bt_start.strftime("%Y-%m-%d"),
                             end_date=bt_end.strftime("%Y-%m-%d"),
                             freq=bt_freq,
-                            buy_threshold=bt_buy,
-                            sell_threshold=bt_sell,
+                            buy_threshold=60, sell_threshold=40,
+                            strategy="active",
                         )
-                        st.session_state["bt_result"] = bt_result
-                        if bt_result is not None:
-                            debug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "debug")
-                            os.makedirs(debug_dir, exist_ok=True)
-                            csv_fn = f"backtest_{stock_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-                            csv_fp = os.path.join(debug_dir, csv_fn)
-                            bt_result.signal_history.to_csv(csv_fp, index=False, encoding='utf-8-sig')
-                            st.session_state["_bt_csv_path"] = csv_fp
-                            st.session_state["_bt_csv_name"] = csv_fn
+                        bt_conservative = run_backtest(
+                            df=base,
+                            stock_id=stock_id,
+                            start_date=bt_start.strftime("%Y-%m-%d"),
+                            end_date=bt_end.strftime("%Y-%m-%d"),
+                            freq=bt_freq,
+                            buy_threshold=70, sell_threshold=50,
+                            strategy="conservative",
+                        )
+                        st.session_state["bt_active"] = bt_active
+                        st.session_state["bt_conservative"] = bt_conservative
+                        st.session_state["bt_result"] = bt_conservative  # 預設顯示保守
+                        st.session_state["bt_strategy"] = "conservative"
+                        
+                        # CSV 暫存於 session_state（不自動存檔，等用戶下載）
+                        if bt_active is not None and not bt_active.signal_history.empty:
+                            csv_data_a = bt_active.signal_history.to_csv(index=False, encoding='utf-8-sig')
+                            st.session_state["_bt_csv_a"] = csv_data_a
+                            csv_data_c = bt_conservative.signal_history.to_csv(index=False, encoding='utf-8-sig')
+                            st.session_state["_bt_csv_c"] = csv_data_c
+                            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                            st.session_state["_bt_csv_name_a"] = f"backtest_{stock_id}_{ts}_60_40.csv"
+                            st.session_state["_bt_csv_name_c"] = f"backtest_{stock_id}_{ts}_70_50.csv"
                 
-                # 顯示回測結果（檢查 stock_id 才顯示）
-                bt = st.session_state.get("bt_result")
-                if bt is not None and bt.stock_id == stock_id:
-                    csv_path = st.session_state.get("_bt_csv_path", "")
-                    csv_filename = st.session_state.get("_bt_csv_name", "backtest.csv")
+                # 顯示回測結果（用 session_state 直接讀取，確保切換立即生效）
+                has_bt_data = ("bt_active" in st.session_state and 
+                               st.session_state["bt_active"] is not None and
+                               st.session_state["bt_active"].stock_id == stock_id)
+                
+                if has_bt_data:
+                    # 策略切換按鈕（使用 on_click callback 確保同次執行生效）
+                    def _switch_to_conservative():
+                        st.session_state["bt_strategy"] = "conservative"
+                        st.session_state["bt_result"] = st.session_state.get("bt_conservative")
+                    def _switch_to_active():
+                        st.session_state["bt_strategy"] = "active"
+                        st.session_state["bt_result"] = st.session_state.get("bt_active")
+                    
+                    cur_strategy = st.session_state.get("bt_strategy", "conservative")
+                    bt = st.session_state.get("bt_conservative") if cur_strategy == "conservative" else st.session_state.get("bt_active")
+                    
+                    col_sw1, col_sw2 = st.columns(2)
+                    with col_sw1:
+                        is_conservative = cur_strategy == "conservative"
+                        st.button("📉 保守 (買≥70/賣<50)", use_container_width=True,
+                                  type="primary" if is_conservative else "secondary",
+                                  on_click=_switch_to_conservative)
+                    with col_sw2:
+                        is_active = cur_strategy == "active"
+                        st.button("📈 積極 (買≥60/賣<40)", use_container_width=True,
+                                  type="primary" if is_active else "secondary",
+                                  on_click=_switch_to_active)
+                    
+                    if is_conservative:
+                        bt_buy = 70
+                        bt_sell = 50
+                        strategy_label = "保守 (70/50)"
+                    else:
+                        bt_buy = 60
+                        bt_sell = 40
+                        strategy_label = "積極 (60/40)"
+                    
+                    st.caption(f"📊 目前顯示：**{strategy_label}** | 買≥{bt_buy} / 賣<{bt_sell}")
                     
                     # === B. 分數走勢圖 ===
                     st.markdown("**📈 四維度分數走勢**")
@@ -848,7 +1011,7 @@ try:
                         ax_bt1.set_ylim(0, 100)
                         ax_bt1.legend(loc="best")
                         ax_bt1.grid(True, alpha=0.3)
-                        ax_bt1.set_title(f"{stock_id} {stock_name} - 歷史評分走勢（{bt.start_date} ~ {bt.end_date}）")
+                        ax_bt1.set_title(f"{stock_id} {stock_name}（{strategy_label}） - 歷史評分走勢（{bt.start_date} ~ {bt.end_date}）")
                         plt.tight_layout()
                         st.pyplot(fig_bt1)
                         plt.close()
@@ -881,7 +1044,7 @@ try:
                     ax_bt2.set_ylabel("價格")
                     ax_bt2.legend(loc="best")
                     ax_bt2.grid(True, alpha=0.3)
-                    ax_bt2.set_title(f"{stock_id} {stock_name} - 價格與買賣訊號")
+                    ax_bt2.set_title(f"{stock_id} {stock_name}（{strategy_label}） - 價格與買賣訊號")
                     plt.tight_layout()
                     st.pyplot(fig_bt2)
                     plt.close()
@@ -925,12 +1088,23 @@ try:
                     else:
                         st.caption("無交易記錄")
                     
-                    # CSV 下載按鈕
+                    # CSV 下載按鈕（積極/保守各一個）
                     st.markdown("---")
                     st.markdown("**💾 回測 CSV 除錯輸出**")
-                    st.caption(f"已儲存至：`{csv_path}`")
-                    csv_data_debug = bt.signal_history.to_csv(index=False, encoding='utf-8-sig')
-                    st.download_button(label="📥 下載回測 CSV", data=csv_data_debug, file_name=csv_filename, mime="text/csv")
+                    st.caption(f"📁 已儲存至：`data/debug/` 目錄")
+                    col_dl1, col_dl2 = st.columns(2)
+                    with col_dl1:
+                        path_a = st.session_state.get("_bt_csv_path_a", "")
+                        fn_a = st.session_state.get("_bt_csv_name_a", "backtest_active.csv")
+                        if st.session_state.get("bt_active") is not None:
+                            csv_data_a = st.session_state["bt_active"].signal_history.to_csv(index=False, encoding='utf-8-sig')
+                            st.download_button(label="📥 下載 積極(60/40) CSV", data=csv_data_a, file_name=fn_a, mime="text/csv")
+                    with col_dl2:
+                        path_c = st.session_state.get("_bt_csv_path_c", "")
+                        fn_c = st.session_state.get("_bt_csv_name_c", "backtest_conservative.csv")
+                        if st.session_state.get("bt_conservative") is not None:
+                            csv_data_c = st.session_state["bt_conservative"].signal_history.to_csv(index=False, encoding='utf-8-sig')
+                            st.download_button(label="📥 下載 保守(70/50) CSV", data=csv_data_c, file_name=fn_c, mime="text/csv")
                         
                 else:
                     # 如果有上次回測結果，顯示它
@@ -959,6 +1133,16 @@ try:
         st.markdown("---")
         st.subheader("📊 四維度分析")
         st.caption("💡 評分解讀：保守型 ≥ 70 分（佳）| 積極型 ≥ 60 分（可考慮進場）| < 50 分（待加強/觀望）")
+        
+        with st.expander("📋 實盤操作 SOP", expanded=False):
+            st.markdown("""
+            | 策略 | 實盤操作指引 |
+            |:---|:---|
+            | 🔴 **短線** | **時效第一** — 出訊號當天收盤價直接買，絕不留單 |
+            | 🟠 **波段** | **趨勢第一** — 出訊號當天收盤價直接買，避免看對卻空手 |
+            | 🔵 **價值** | **價格第一** — 保留舊單掛限價 **agg_low**，有效期限 3~5 天 |
+            | 🟢 **定存** | **成本第一** — 追求高殖利率，保留舊單掛限價 **cons_low** |
+            """)
         
         score_labels = {
             "short_term": ("短線", "🔴"),
@@ -1074,7 +1258,12 @@ try:
         style_names = {"short_term": "短線", "swing": "波段", "value": "價值", "dividend": "定存"}
         best_style_name = style_names.get(best_style, best_style)
         
-        if advice_text in ["強烈買進", "買進"]:
+        # 檢查 trade_advice 是否為觀望/不建議（飛刀濾網情境）
+        # 若是，覆蓋 get_advice 的買進建議，避免兩種建議矛盾
+        ta_action = trade_advice.action if trade_advice else ""
+        if trade_advice and ta_action in ("觀望", "不建議"):
+            st.info(f"ℹ️ 基本建議：觀望（各風格分數最高為 {best_style_name} {best_score}/100，但觸發安全濾網）")
+        elif advice_text in ["強烈買進", "買進"]:
             st.success(f"✅ 建議：{advice_text}（最佳風格：{best_style_name}，{best_score}/100）")
         elif advice_text in ["持有"]:
             st.info(f"ℹ️ 建議：{advice_text}（最佳風格：{best_style_name}，{best_score}/100）")
@@ -1085,26 +1274,37 @@ try:
         st.subheader("🎯 持倉建議")
         if trade_advice:
             ta = trade_advice
-            # 根據動作顯示不同顏色
+            # 使用 st.markdown 取代 st.info/st.warning，確保 \n 換行正確渲染
+            display_msg = ta.message.replace('\n', '  \n')  # markdown 換行需要行尾兩個空格
             if ta.action in ("買進", "加碼"):
-                st.success(f"**{ta.message}**")
+                st.success(display_msg)
             elif ta.action in ("賣出", "減碼", "不建議"):
-                st.warning(f"**{ta.message}**")
+                st.warning(display_msg)
             else:
-                st.info(f"**{ta.message}**")
+                st.info(display_msg)
             
             # 顯示詳細資訊
             with st.expander("📋 持倉判斷明細"):
                 st.caption(f"動作：{ta.action}")
                 st.caption(f"認領風格：{ta.style}")
-                if ta.entry_price:
-                    st.caption(f"建議買入價：{ta.entry_price}")
+                
+                # 主導建議買價區間（僅買進/加碼時顯示）
+                is_buy_action = ta.action in ("買進", "加碼")
+                is_watch_action = ta.action in ("觀望", "不建議")
+                if is_buy_action and ta.entry_price is not None:
+                    if ta.entry_price_low is not None and ta.entry_price_high is not None:
+                        st.caption(f"🎯 主導建議買價區間：{ta.entry_price_low:.2f} ~ {ta.entry_price_high:.2f} 元（核心 {ta.entry_price:.2f} 元）")
+                    else:
+                        st.caption(f"🎯 建議買入價：{ta.entry_price:.2f} 元")
+                
+                # 雙軌價位已在主訊息中顯示，此處不重複
+                
                 if ta.stop_loss:
-                    st.caption(f"建議停損價：{ta.stop_loss}")
+                    st.caption(f"建議停損價：{ta.stop_loss:.2f}")
                 if ta.current_price:
-                    st.caption(f"最新收盤價：{ta.current_price}")
+                    st.caption(f"最新收盤價：{ta.current_price:.2f}")
                 if ta.reference_ma:
-                    st.caption(f"參考均線：{ta.ma_type} = {ta.reference_ma}")
+                    st.caption(f"參考均線：{ta.ma_type} = {ta.reference_ma:.2f}")
                 st.caption(f"風險等級：{ta.risk_level}")
                 st.caption(f"判斷理由：{ta.reason}")
         else:
@@ -1338,13 +1538,10 @@ try:
                 with st.expander("📄 查看完整欄位列表"):
                     st.write(list(base.columns))
             
-            # ===== 分頁 5：匯出 CSV =====
+            # ===== 分頁 5：匯出 CSV（改為手動） =====
             with tab_debug5:
                 st.markdown("**💾 匯出 Debug CSV**")
-                st.caption("匯出母表（含所有計算欄位）為 CSV，可用 Excel 比對各項指標數值")
-                
-                # 除錯用途：直接輸出全部母表資料，不讓使用者選範圍
-                export_df = base
+                st.caption("選擇欄位後，點擊按鈕手動匯出母表 CSV 到 bug/ 目錄")
                 
                 # 選擇要匯出的欄位群組
                 export_cols = st.multiselect(
@@ -1354,30 +1551,36 @@ try:
                     key="export_cols"
                 )
                 
-                # 每次進入第五項時，根據當前選擇重新產生 CSV
-                export_cols_selected = export_cols if export_cols else list(base.columns)
-                export_df_selected = export_df[export_cols_selected]
-                csv_data = export_df_selected.to_csv(index=False, encoding='utf-8-sig')
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"{stock_id}_{timestamp}_debug.csv"
-                
-                # 存到 bug/ 目錄
-                bug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bug")
-                os.makedirs(bug_dir, exist_ok=True)
-                filepath = os.path.join(bug_dir, filename)
-                with open(filepath, "w", encoding="utf-8-sig") as f:
-                    f.write(csv_data)
-                
-                st.success(f"✅ 已儲存至：`{filepath}`")
-                st.caption(f"📊 {len(export_df_selected)} 行 x {len(export_df_selected.columns)} 欄")
+                # 手動按鈕
+                if st.button("💾 手動匯出 CSV", type="primary"):
+                    export_cols_selected = export_cols if export_cols else list(base.columns)
+                    export_df_selected = base[export_cols_selected]
+                    csv_data = export_df_selected.to_csv(index=False, encoding='utf-8-sig')
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"{stock_id}_{timestamp}_debug.csv"
+                    
+                    # 存到 bug/ 目錄
+                    bug_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bug")
+                    os.makedirs(bug_dir, exist_ok=True)
+                    filepath = os.path.join(bug_dir, filename)
+                    with open(filepath, "w", encoding="utf-8-sig") as f:
+                        f.write(csv_data)
+                    
+                    st.success(f"✅ 已儲存至：`{filepath}`")
+                    st.caption(f"📊 {len(export_df_selected)} 行 x {len(export_df_selected.columns)} 欄")
+                else:
+                    st.info("點擊上方按鈕手動匯出 CSV")
     
     # ===== 瀑布流 6：回測結果摘要（若有執行過） =====
     with waterfall_6.container():
         _bt = st.session_state.get("bt_result")
         if _bt is not None and _bt.stock_id == stock_id:
             bt = _bt
+            cur_strategy = st.session_state.get("bt_strategy", "active")
+            strategy_label = "積極 (60/40)" if cur_strategy == "active" else "保守 (70/50)"
+            
             st.markdown("---")
-            st.subheader("📊 回測結果摘要")
+            st.subheader(f"📊 回測結果摘要（{strategy_label}）")
             
             style_names = {
                 "short_term": "短線", "swing": "波段",

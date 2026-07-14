@@ -1,5 +1,5 @@
 """
-ai/analyzer.py v4.0
+ai/analyzer.py
 DeepSeek API 呼叫 — Explain Engine 版本
 
 v4.0 重大改版：
@@ -24,6 +24,7 @@ def analyze_with_deepseek(
     avg_price: float = 0.0,
     shares: int = 0,
     api_key: str = "",
+    trade_advice: object = None,
 ) -> dict:
     """
     呼叫 DeepSeek API 進行 AI 解說分析
@@ -62,7 +63,8 @@ def analyze_with_deepseek(
         system_prompt = build_system_prompt()
         user_message = build_user_message(
             stock_id, stock_name, scores, advice,
-            has_position, avg_price, shares
+            has_position, avg_price, shares,
+            trade_advice=trade_advice,
         )
         
         # 呼叫 DeepSeek API
@@ -165,5 +167,5 @@ def _build_fallback_explanation(
 
 
 if __name__ == "__main__":
-    print("analyzer.py v4.0 - Explain Engine 版本完成")
+    print("analyzer.py — Explain Engine 版本完成")
     print("支援 DeepSeek API 呼叫，輸出 explanation 格式")
