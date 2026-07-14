@@ -32,7 +32,7 @@ from data.processor import build_universal_base_table, calculate_derived_columns
 
 from stock.metrics import calculate_technical_indicators, calculate_financial_indicators
 from core.scorer import get_all_scores, get_historical_scores
-from core.backtest import run_backtest
+from core.backtest import _calc_realized_return_sum, _calc_unrealized_return
 from core.advisor import get_advice
 from core.trade_manager import generate_trade_advice
 from ai.analyzer import analyze_with_deepseek
@@ -660,9 +660,43 @@ try:
         
         run_bt = st.session_state.get("run_backtest", False)
         
-        tab1, tab2, tab3, tab4 = st.tabs(["短線面", "中長線面", "📊 回測分析", "📰 新聞輿情"])
+        # 使用 selectbox 取代 st.tabs，避免 rerun 後跳回第一個 tab
+        tab_options = ["短線面", "中長線面", "📊 回測分析", "📰 新聞輿情"]
+        tab_default = st.session_state.get("_active_tab", 0)
+        if "_active_tab" not in st.session_state:
+            st.session_state["_active_tab"] = 0
+        tab_labels = " | ".join([f"{'📌' if i == st.session_state['_active_tab'] else '  '} {t}" for i, t in enumerate(tab_options)])
+        st.caption(tab_labels)
         
-        with tab1:
+        # 隱藏 tab 按鍵，直接用 columns 按鈕
+        col_tab1, col_tab2, col_tab3, col_tab4 = st.columns(4)
+        with col_tab1:
+            if st.button("短線面", use_container_width=True, 
+                         type="primary" if st.session_state["_active_tab"] == 0 else "secondary",
+                         key="tab_btn_0"):
+                st.session_state["_active_tab"] = 0
+                st.rerun()
+        with col_tab2:
+            if st.button("中長線面", use_container_width=True,
+                         type="primary" if st.session_state["_active_tab"] == 1 else "secondary",
+                         key="tab_btn_1"):
+                st.session_state["_active_tab"] = 1
+                st.rerun()
+        with col_tab3:
+            if st.button("📊 回測分析", use_container_width=True,
+                         type="primary" if st.session_state["_active_tab"] == 2 else "secondary",
+                         key="tab_btn_2"):
+                st.session_state["_active_tab"] = 2
+                st.rerun()
+        with col_tab4:
+            if st.button("📰 新聞輿情", use_container_width=True,
+                         type="primary" if st.session_state["_active_tab"] == 3 else "secondary",
+                         key="tab_btn_3"):
+                st.session_state["_active_tab"] = 3
+                st.rerun()
+        
+        # Tab 0: 短線面
+        if st.session_state["_active_tab"] == 0:
             st.markdown("**短線面圖表（近 1 個月）**")
             
             # 過濾近 1 個月資料（約 21 個交易日）
@@ -777,7 +811,8 @@ try:
                 df_chip = df_chip.rename(columns=lambda c: f"{cn(c)} ({c})" if c != "date" else c)
                 st.dataframe(df_chip, use_container_width=True, hide_index=True)
         
-        with tab2:
+        # Tab 1: 中長線面
+        elif st.session_state["_active_tab"] == 1:
             # 中長線 → 依三種評分風格權重最高的維度分 tab
             tab2a, tab2b, tab2c = st.tabs(["🟠 波段動能 (營收+趨勢+籌碼)", "🔵 價值成長 (ROE+EPS+毛利率)", "🟢 定存安全 (股利+負債+PE/PB)"])
             
@@ -1020,8 +1055,8 @@ try:
                     df_div_tbl = df_div_tbl.rename(columns=lambda c: f"{cn(c)} ({c})" if c != "date" else c)
                     st.dataframe(df_div_tbl, use_container_width=True, hide_index=True)
     
-        # ===== Tab 3: 📊 回測分析（雙策略：積極+保守） =====
-        with tab3:
+        # Tab 2: 📊 回測分析（雙策略：積極+保守）
+        elif st.session_state["_active_tab"] == 2:
             st.markdown("**📊 回測分析**")
             
             if not run_bt:
@@ -1033,19 +1068,37 @@ try:
                     bt_end = st.date_input("回測結束日", value=datetime.now())
                     bt_freq = st.selectbox("輸出頻率", options=["W", "M", "D"], index=2, format_func=lambda x: {"W": "每週", "M": "每月", "D": "每日"}.get(x, x))
                     st.caption("📌 回測將同時執行積極(買≥60/賣<40)和保守(買≥70/賣<50)兩種策略")
+                    
+                    # 50/50 雙彈夾分批建倉
+                    bt_dual_bullet = st.checkbox("🔫 啟用 50/50 雙彈夾分批建倉", value=False, key="bt_dual_bullet")
+                    if bt_dual_bullet:
+                        bt_dual_mode = st.selectbox("加碼方式", options=["dip", "breakout"], index=0,
+                            format_func=lambda x: {"dip": "📉 下跌加碼（回檔第二筆）", "breakout": "📈 順勢突破（新高加碼）"}.get(x, x),
+                            key="bt_dual_mode")
+                        bt_dual_drop = st.number_input("下跌加碼門檻（%）：", value=-8.0, step=1.0, key="bt_dual_drop",
+                            help="第一發進場後，價格跌 X% 才打入第二發（僅下跌加碼模式有效）")
+                    
                     bt_run = st.button("▶️ 執行回測（雙策略）", type="primary")
                 
-                # 清除舊股票的回測殘留
+                # 清除舊股票的回測殘留（含 AI 解說）
                 if "bt_result" in st.session_state and st.session_state["bt_result"].stock_id != stock_id:
                     for k in ["bt_result", "bt_active", "bt_conservative", 
                                "_bt_csv_path_a", "_bt_csv_name_a",
-                               "_bt_csv_path_c", "_bt_csv_name_c", "bt_strategy"]:
+                               "_bt_csv_path_c", "_bt_csv_name_c", "bt_strategy",
+                               "_bt_ai_requested", "_bt_ai_result"]:
                         st.session_state.pop(k, None)
+                
+                # 讀取雙彈夾設定（預設關閉）
+                _bt_dual = st.session_state.get("bt_dual_bullet", False)
+                _bt_dual_mode = st.session_state.get("bt_dual_mode", "dip")
+                _bt_dual_drop = st.session_state.get("bt_dual_drop", -8.0)
                 
                 # 每次點擊「執行回測」都重新執行 — 同時跑積極(70/50)和保守(60/40)
                 if bt_run:
-                    with st.spinner("⏳ 執行回測中（雙策略：積極 60/40 + 保守 70/50）..."):
-                        bt_active = run_backtest(
+                    from core.backtest import run_backtest as _run_backtest
+                    db_label = "+ 雙彈夾" if _bt_dual else ""
+                    with st.spinner(f"⏳ 執行回測中（積極 60/40 + 保守 70/50 {db_label}）..."):
+                        bt_active = _run_backtest(
                             df=base,
                             stock_id=stock_id,
                             start_date=bt_start.strftime("%Y-%m-%d"),
@@ -1053,8 +1106,11 @@ try:
                             freq=bt_freq,
                             buy_threshold=60, sell_threshold=40,
                             strategy="active",
+                            dual_bullet=_bt_dual,
+                            dual_bullet_mode=_bt_dual_mode,
+                            dual_bullet_drop_pct=_bt_dual_drop,
                         )
-                        bt_conservative = run_backtest(
+                        bt_conservative = _run_backtest(
                             df=base,
                             stock_id=stock_id,
                             start_date=bt_start.strftime("%Y-%m-%d"),
@@ -1062,6 +1118,9 @@ try:
                             freq=bt_freq,
                             buy_threshold=70, sell_threshold=50,
                             strategy="conservative",
+                            dual_bullet=_bt_dual,
+                            dual_bullet_mode=_bt_dual_mode,
+                            dual_bullet_drop_pct=_bt_dual_drop,
                         )
                         st.session_state["bt_active"] = bt_active
                         st.session_state["bt_conservative"] = bt_conservative
@@ -1171,24 +1230,27 @@ try:
                     st.pyplot(fig_bt2)
                     plt.close()
                     
-                    # === D. 績效摘要表 ===
-                    st.markdown("**📋 五種策略績效總覽**")
-                    style_names = {"short_term": "短線", "swing": "波段", "value": "價值", "dividend": "定存", "composite": "綜合"}
-                    perf_cols = st.columns(5)
+                    # === D. 績效摘要表（含已實現/未實現損益 + 雙彈夾） ===
+                    st.markdown("**📋 策略績效總覽**")
+                    style_names = {"short_term": "短線", "swing": "波段", "value": "價值", "dividend": "定存", "composite": "綜合", "dual_bullet": "🔫 雙彈夾"}
+                    perf_cols = st.columns(len(style_names))
                     for i, (sk, scn) in enumerate(style_names.items()):
                         with perf_cols[i]:
                             sd = bt.styles.get(sk, {})
+                            trades_list = sd.get("trades", [])
                             tc = sd.get("trade_count", 0)
                             ret = sd.get("total_return_pct", 0.0)
-                            wr = sd.get("win_rate", 0.0)
                             delta = f"⬆️ +{ret:.1f}%" if ret > 10 else (f"↗️ +{ret:.1f}%" if ret > 0 else (f"➖ 0%" if ret == 0 else f"⬇️ {ret:.1f}%"))
                             st.metric(f"{scn}", f"{tc}筆", delta)
-                            win_rate_str = f"勝率: {wr:.0f}%" if wr is not None else "勝率: -"
-                            st.caption(win_rate_str)
-                            holding_trades = [t for t in sd.get("trades", []) if t.status == "持有中"]
-                            if holding_trades:
-                                for ht in holding_trades:
-                                    st.info(f"✅ {ht.style}持有中")
+                            # 已實現 / 未實現損益
+                            realized_sum = _calc_realized_return_sum(trades_list)
+                            unrealized_pct = _calc_unrealized_return(trades_list)
+                            if realized_sum != 0:
+                                st.caption(f"✔️ 已實現: {realized_sum:+.2f}%")
+                            elif unrealized_pct is not None:
+                                st.caption(f"✔️ 已實現: 0%")
+                            if unrealized_pct is not None:
+                                st.caption(f"⏳ 持有中: {unrealized_pct:+.2f}%")
                             st.markdown("---")
                     
                     # 交易明細表
@@ -1221,13 +1283,138 @@ try:
                         if st.session_state.get("bt_active") is not None:
                             csv_data_a = st.session_state["bt_active"].signal_history.to_csv(index=False, encoding='utf-8-sig')
                             st.download_button(label="📥 下載 積極(60/40) CSV", data=csv_data_a, file_name=fn_a, mime="text/csv")
-                    with col_dl2:
-                        path_c = st.session_state.get("_bt_csv_path_c", "")
-                        fn_c = st.session_state.get("_bt_csv_name_c", "backtest_conservative.csv")
-                        if st.session_state.get("bt_conservative") is not None:
-                            csv_data_c = st.session_state["bt_conservative"].signal_history.to_csv(index=False, encoding='utf-8-sig')
-                            st.download_button(label="📥 下載 保守(70/50) CSV", data=csv_data_c, file_name=fn_c, mime="text/csv")
+                        with col_dl2:
+                            path_c = st.session_state.get("_bt_csv_path_c", "")
+                            fn_c = st.session_state.get("_bt_csv_name_c", "backtest_conservative.csv")
+                            if st.session_state.get("bt_conservative") is not None:
+                                csv_data_c = st.session_state["bt_conservative"].signal_history.to_csv(index=False, encoding='utf-8-sig')
+                                st.download_button(label="📥 下載 保守(70/50) CSV", data=csv_data_c, file_name=fn_c, mime="text/csv")
+                    
+                    # 雙彈夾 CSV 下載（如果該策略有雙彈夾資料）
+                    _bt_db_a = st.session_state.get("bt_active", None)
+                    _bt_db_c = st.session_state.get("bt_conservative", None)
+                    if _bt_dual and (_bt_db_a is not None or _bt_db_c is not None):
+                        st.markdown("**🔫 雙彈夾交易紀錄**")
+                        col_db1, col_db2 = st.columns(2)
+                        with col_db1:
+                            if _bt_db_a is not None and len(_bt_db_a.styles.get("dual_bullet", {}).get("trades", [])) > 0:
+                                import io
+                                buf = io.StringIO()
+                                buf.write("日期,價格,動作,第一發進場價,第二發進場價,均價,狀態,報酬率\n")
+                                for t in _bt_db_a.styles["dual_bullet"]["trades"]:
+                                    p1_date = t.entry_date.strftime('%Y-%m-%d') if hasattr(t.entry_date,'strftime') else str(t.entry_date)
+                                    p2_price = f"{t.entry_price_2:.2f}" if t.entry_price_2 is not None else "-"
+                                    avg = f"{t.avg_cost:.2f}" if t.avg_cost is not None else "-"
+                                    ex_date = t.exit_date.strftime("%Y-%m-%d") if (t.exit_date and hasattr(t.exit_date,'strftime')) else ("-" if t.exit_date is None else str(t.exit_date))
+                                    ex_price = f"{t.exit_price:.2f}" if t.exit_price is not None else "-"
+                                    buf.write(f"{p1_date},{t.entry_price:.2f},買入(一發),{t.entry_price:.2f},,,\n")
+                                    if t.entry_price_2 is not None:
+                                        buf.write(f"{ex_date},{p2_price},買入(二發),{t.entry_price:.2f},{p2_price},{avg},\n")
+                                    action = "賣出(全數)" if t.status == "已出清" else "持有中"
+                                    buf.write(f"{ex_date},{ex_price},{action},{t.entry_price:.2f},{p2_price},{avg},{t.status},{t.return_pct:+.2f}%\n")
+                                buf.seek(0)
+                                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                                st.download_button("🔫 下載 積極+雙彈夾 CSV", data=buf.getvalue(), file_name=f"dual_bullet_{stock_id}_{ts}_60_40.csv", mime="text/csv")
+                        with col_db2:
+                            if _bt_db_c is not None and len(_bt_db_c.styles.get("dual_bullet", {}).get("trades", [])) > 0:
+                                import io
+                                buf2 = io.StringIO()
+                                buf2.write("日期,價格,動作,第一發進場價,第二發進場價,均價,狀態,報酬率\n")
+                                for t in _bt_db_c.styles["dual_bullet"]["trades"]:
+                                    p1_date = t.entry_date.strftime('%Y-%m-%d') if hasattr(t.entry_date,'strftime') else str(t.entry_date)
+                                    p2_price = f"{t.entry_price_2:.2f}" if t.entry_price_2 is not None else "-"
+                                    avg = f"{t.avg_cost:.2f}" if t.avg_cost is not None else "-"
+                                    ex_date = t.exit_date.strftime("%Y-%m-%d") if (t.exit_date and hasattr(t.exit_date,'strftime')) else ("-" if t.exit_date is None else str(t.exit_date))
+                                    ex_price = f"{t.exit_price:.2f}" if t.exit_price is not None else "-"
+                                    buf2.write(f"{p1_date},{t.entry_price:.2f},買入(一發),{t.entry_price:.2f},,,\n")
+                                    if t.entry_price_2 is not None:
+                                        buf2.write(f"{ex_date},{p2_price},買入(二發),{t.entry_price:.2f},{p2_price},{avg},\n")
+                                    action = "賣出(全數)" if t.status == "已出清" else "持有中"
+                                    buf2.write(f"{ex_date},{ex_price},{action},{t.entry_price:.2f},{p2_price},{avg},{t.status},{t.return_pct:+.2f}%\n")
+                                buf2.seek(0)
+                                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                                st.download_button("🔫 下載 保守+雙彈夾 CSV", data=buf2.getvalue(), file_name=f"dual_bullet_{stock_id}_{ts}_70_50.csv", mime="text/csv")
+                    
+                    # ===== E. 🤖 AI 回測解說（點位解說版） =====
+                    st.markdown("---")
+                    st.subheader("🤖 AI 回測點位解說")
+                    st.caption("AI 像專業分析師一樣，順著時間軸解說每筆進出點位的時空背景")
+                    
+                    # 兩顆按鈕：保守解說 / 積極解說
+                    col_ai1, col_ai2 = st.columns(2)
+                    with col_ai1:
+                        ai_btn_conservative = st.button(
+                            "🤖 解說保守策略 (70/50)",
+                            use_container_width=True,
+                            type="secondary",
+                            key="bt_ai_btn_conservative",
+                        )
+                    with col_ai2:
+                        ai_btn_active = st.button(
+                            "🤖 解說積極策略 (60/40)",
+                            use_container_width=True,
+                            type="secondary",
+                            key="bt_ai_btn_active",
+                        )
+                    
+                    # 追蹤被按下的解說按鈕
+                    if ai_btn_conservative:
+                        st.session_state["_bt_ai_requested"] = "conservative"
+                        st.session_state["_bt_ai_result"] = None
+                    if ai_btn_active:
+                        st.session_state["_bt_ai_requested"] = "active"
+                        st.session_state["_bt_ai_result"] = None
+                    
+                    # 檢查是否有請求 + 是否有 deepseek key
+                    _bt_ai_requested = st.session_state.get("_bt_ai_requested", None)
+                    _bt_ai_result = st.session_state.get("_bt_ai_result", None)
+                    
+                    if _bt_ai_requested and _bt_ai_result is None:
+                        if _bt_ai_requested == "conservative":
+                            _bt_ai_target = st.session_state.get("bt_conservative")
+                            _bt_ai_label = "保守 (70/50)"
+                        else:
+                            _bt_ai_target = st.session_state.get("bt_active")
+                            _bt_ai_label = "積極 (60/40)"
                         
+                        if _bt_ai_target is None:
+                            st.warning("⚠️ 請先執行回測（點擊「▶️ 執行回測（雙策略）」）")
+                        elif not deepseek_api_key:
+                            st.info("ℹ️ 請輸入 DeepSeek API Key 以獲得 AI 回測點位解說")
+                        else:
+                            from ai.analyzer import analyze_backtest_with_deepseek
+                            with st.spinner(f"🤖 AI 正在解說 {_bt_ai_label} 策略的進出點位..."):
+                                _bt_ai_result = analyze_backtest_with_deepseek(
+                                    stock_id=stock_id,
+                                    stock_name=stock_name,
+                                    strategy_label=_bt_ai_label,
+                                    bt_result=_bt_ai_target,
+                                    api_key=deepseek_api_key,
+                                )
+                                st.session_state["_bt_ai_result"] = _bt_ai_result
+                    
+                    # 顯示 AI 解說結果
+                    _bt_ai_result = st.session_state.get("_bt_ai_result", None)
+                    if _bt_ai_result is not None:
+                        ba = _bt_ai_result.get("backtest_analysis", {})
+                        
+                        # 1. 一句話總結
+                        if ba.get("summary"):
+                            st.markdown(f"**📝 一句話總結**")
+                            st.info(ba["summary"])
+                        
+                        # 2. 交易點位深度解說（故事性敘述，含進出點位時空背景）
+                        if ba.get("narrative"):
+                            st.markdown("**📖 交易點位深度解說**")
+                            st.markdown(ba["narrative"])
+                        
+                        # 3. 整體策略核心診斷
+                        if ba.get("diagnosis"):
+                            st.markdown("**🔍 整體策略核心診斷**")
+                            st.warning(ba["diagnosis"])
+                    
+                    # == 結束 AI 回測解說區塊 ==
+                            
                 else:
                     # 如果有上次回測結果，顯示它
                     if st.session_state.get("bt_result") is not None:
@@ -1250,8 +1437,8 @@ try:
                                     win_rate_str = f"勝率: {wr:.0f}%" if wr is not None else "勝率: -"
                                     st.caption(win_rate_str)
     
-        # ===== Tab 4: 📰 新聞輿情 =====
-        with tab4:
+        # Tab 3: 📰 新聞輿情
+        elif st.session_state["_active_tab"] == 3:
             st.markdown("**📰 新聞輿情分析**")
             st.caption("分析時已自動抓取新聞存入資料庫，下方直接顯示歷史數據。可點「更新新聞」手動重新抓取。")
             

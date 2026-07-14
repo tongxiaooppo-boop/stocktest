@@ -170,6 +170,125 @@ def _build_fallback_explanation(
     }
 
 
+# ============================================================
+# Backtest AI 解說
+# ============================================================
+
+def analyze_backtest_with_deepseek(
+    stock_id: str,
+    stock_name: str,
+    strategy_label: str,
+    bt_result: object,
+    api_key: str = "",
+) -> dict:
+    """
+    呼叫 DeepSeek API 分析回測結果（短線/波段/價值/定存 四種風格解說）
+    
+    Args:
+        stock_id: 股票代號
+        stock_name: 股票名稱
+        strategy_label: 策略名稱（如「積極 60/40」或「保守 70/50」）
+        bt_result: BacktestResult 物件（含 signal_history + styles 績效）
+        api_key: DeepSeek API Key
+    
+    Returns:
+        dict: {
+            "backtest_analysis": {
+                "summary": "整體回測成效摘要",
+                "style_analysis": {
+                    "short_term": {"performance": "...", "comment": "..."},
+                    ...
+                },
+                "key_insights": [...],
+                "conclusion": "..."
+            }
+        }
+        或降級回應
+    """
+    from ai.prompts import build_backtest_system_prompt, build_backtest_user_message
+    
+    if not api_key:
+        return _build_fallback_backtest_analysis(
+            stock_id, stock_name, strategy_label,
+            "請輸入 DeepSeek API Key"
+        )
+    
+    try:
+        # 建構 Prompt
+        system_prompt = build_backtest_system_prompt()
+        user_message = build_backtest_user_message(
+            stock_id, stock_name, strategy_label, bt_result
+        )
+        
+        # 呼叫 DeepSeek API
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.deepseek.com"
+        )
+        
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=0.3,
+            max_tokens=2500,
+        )
+        
+        content = response.choices[0].message.content.strip()
+        result = _extract_json(content)
+        
+        if result is None:
+            return _build_fallback_backtest_analysis(
+                stock_id, stock_name, strategy_label,
+                "AI 回傳格式異常，無法解析"
+            )
+        
+        # 確保是 backtest_analysis 格式
+        if "backtest_analysis" not in result:
+            result = {"backtest_analysis": result}
+        
+        result["stock_id"] = stock_id
+        result["stock_name"] = stock_name
+        result["strategy_label"] = strategy_label
+        
+        return result
+        
+    except Exception as e:
+        return _build_fallback_backtest_analysis(
+            stock_id, stock_name, strategy_label,
+            f"AI 分析異常: {str(e)}"
+        )
+
+
+def _build_fallback_backtest_analysis(
+    stock_id: str,
+    stock_name: str,
+    strategy_label: str,
+    error_msg: str,
+) -> dict:
+    """建構回測分析的降級回應"""
+    return {
+        "stock_id": stock_id,
+        "stock_name": stock_name,
+        "strategy_label": strategy_label,
+        "backtest_analysis": {
+            "summary": f"AI 回測解說暫時不可用：{error_msg}",
+            "style_analysis": {
+                "short_term": {"performance": "無法分析", "comment": ""},
+                "swing": {"performance": "無法分析", "comment": ""},
+                "value": {"performance": "無法分析", "comment": ""},
+                "dividend": {"performance": "無法分析", "comment": ""},
+                "composite": {"performance": "無法分析", "comment": ""},
+            },
+            "key_insights": ["請稍後再試"],
+            "conclusion": error_msg,
+        },
+    }
+
+
 if __name__ == "__main__":
     print("analyzer.py — Explain Engine 版本完成")
     print("支援 DeepSeek API 呼叫，輸出 explanation 格式")
+    print("新增 analyze_backtest_with_deepseek — 回測 AI 解說")

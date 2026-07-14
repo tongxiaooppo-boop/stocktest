@@ -7,6 +7,7 @@ core/backtest.py
 2. run_dual_backtest()：同時跑積極(70/50)與保守(60/40)兩種策略，並存檔
 3. 買賣訊號：基於分數 threshold 交叉，獨立於 trade_manager
 4. 綜合策略：≥2 種 ≥ buy_threshold 買入，≥2 種 < sell_threshold 賣出，加權平均成本
+5. 雙彈夾策略：50/50 分批建倉 + 加碼 + 全數出場
 """
 import pandas as pd
 import numpy as np
@@ -33,6 +34,10 @@ class TradeRecord:
     style: str = ""          # 風格
     status: str = "持有中"   # 持有中 / 已出清
     return_pct: float = 0.0  # 報酬率（已實現或未實現）
+    # 雙彈夾專用
+    entry_price_2: float = None  # 第二發進場價（有加碼才有）
+    avg_cost: float = None       # 加權平均成本（有加碼才有）
+
 
 @dataclass
 class BacktestResult:
@@ -52,6 +57,7 @@ class BacktestResult:
         "value": {"trades": [], "total_return_pct": 0.0, "win_rate": 0.0, "trade_count": 0},
         "dividend": {"trades": [], "total_return_pct": 0.0, "win_rate": 0.0, "trade_count": 0},
         "composite": {"trades": [], "total_return_pct": 0.0, "win_rate": 0.0, "trade_count": 0},
+        "dual_bullet": {"trades": [], "total_return_pct": 0.0, "win_rate": 0.0, "trade_count": 0},
     })
     
     # 各風格歷史狀態（每個時間點的分數 + 訊號）
@@ -71,14 +77,12 @@ def run_backtest(
     buy_threshold: int = 70,
     sell_threshold: int = 50,
     strategy: str = "",
+    dual_bullet: bool = False,
+    dual_bullet_mode: str = "dip",
+    dual_bullet_drop_pct: float = -8.0,
 ) -> BacktestResult:
     """
     執行完整回測
-    
-    流程：
-    1. 呼叫 get_historical_scores 取得歷史分數
-    2. 五種策略各自解析買賣訊號
-    3. 計算各策略績效
     
     Parameters:
         df: 母表 DataFrame
@@ -88,7 +92,10 @@ def run_backtest(
         freq: 頻率（D/W/M/Q）
         buy_threshold: 買入門檻分數（預設 70）
         sell_threshold: 賣出門檻分數（預設 50）
-        strategy: 策略名稱（"active" 或 "conservative"，留空則自動判斷）
+        strategy: 策略名稱
+        dual_bullet: 是否啟用雙彈夾分批建倉
+        dual_bullet_mode: 加碼模式（dip=下跌加碼, breakout=順勢突破）
+        dual_bullet_drop_pct: 下跌加碼門檻（預設 -8%）
     
     Returns:
         BacktestResult: 完整回測結果
@@ -183,6 +190,20 @@ def run_backtest(
     result.styles["composite"]["trade_count"] = len(composite_trades)
     result.styles["composite"]["total_return_pct"] = _calc_total_return(composite_trades)
     result.styles["composite"]["win_rate"] = _calc_win_rate(composite_trades)
+    
+    # 雙彈夾策略（如果啟用）
+    if dual_bullet:
+        # 用 short_term_score 作為主要訊號源
+        bullet_trades = _parse_dual_bullet_trades(
+            hist_df, style_scores,
+            buy_threshold, sell_threshold,
+            mode=dual_bullet_mode,
+            drop_pct=dual_bullet_drop_pct,
+        )
+        result.styles["dual_bullet"]["trades"] = bullet_trades
+        result.styles["dual_bullet"]["trade_count"] = len(bullet_trades)
+        result.styles["dual_bullet"]["total_return_pct"] = _calc_total_return(bullet_trades)
+        result.styles["dual_bullet"]["win_rate"] = _calc_win_rate(bullet_trades)
     
     # === 3. 訊號歷史（給 CSV 輸出和圖表用） ===
     tech_cols = ["MA_5", "MA_10", "MA_20", "MA_60", "pe_ratio", "PE_Percentile",
@@ -314,6 +335,9 @@ def run_dual_backtest(
     end_date: str = None,
     freq: str = 'W',
     output_dir: str = None,
+    dual_bullet: bool = False,
+    dual_bullet_mode: str = "dip",
+    dual_bullet_drop_pct: float = -8.0,
 ) -> Tuple[BacktestResult, BacktestResult]:
     """
     同時執行積極(70/50)和保守(60/40)兩種策略的回測
@@ -336,6 +360,9 @@ def run_dual_backtest(
         freq=freq,
         buy_threshold=70, sell_threshold=50,
         strategy="active",
+        dual_bullet=dual_bullet,
+        dual_bullet_mode=dual_bullet_mode,
+        dual_bullet_drop_pct=dual_bullet_drop_pct,
     )
     
     # 保守策略：買≥60 / 賣<40
@@ -345,6 +372,9 @@ def run_dual_backtest(
         freq=freq,
         buy_threshold=60, sell_threshold=40,
         strategy="conservative",
+        dual_bullet=dual_bullet,
+        dual_bullet_mode=dual_bullet_mode,
+        dual_bullet_drop_pct=dual_bullet_drop_pct,
     )
     
     # 若指定輸出目錄，則自動存檔
@@ -544,11 +574,163 @@ def _parse_composite_trades(
 
 
 # ============================================================
+# 雙彈夾 50/50 分批建倉策略
+# ============================================================
+
+def _parse_dual_bullet_trades(
+    hist_df: pd.DataFrame,
+    style_scores: dict,
+    buy_threshold: int = 70,
+    sell_threshold: int = 50,
+    mode: str = "dip",
+    drop_pct: float = -8.0,
+) -> List[TradeRecord]:
+    """
+    50/50 雙彈夾分批建倉策略
+    
+    狀態機：
+      state=0: 空手
+      state=1: 持第一發（50%資金）
+      state=2: 滿倉（兩發皆打）
+    
+    Args:
+        hist_df: 歷史分數 DataFrame
+        style_scores: 風格分數欄位對照
+        buy_threshold: 買入門檻
+        sell_threshold: 賣出門檻
+        mode: 加碼模式（"dip"=下跌加碼, "breakout"=順勢突破）
+        drop_pct: 下跌加碼門檻（如 -8.0 表示跌8%加碼）
+    
+    Returns:
+        List[TradeRecord]: 雙彈夾交易記錄
+    """
+    trades = []
+    state = 0       # 0=空手, 1=一發, 2=滿倉
+    entry_1 = 0.0    # 第一發進場價
+    entry_1_date = None
+    entry_2 = 0.0    # 第二發進場價（若有加碼）
+    entry_2_date = None
+    avg_cost = 0.0   # 加權平均成本
+    
+    # 取四種風格分數的最高分作為綜合判斷
+    score_cols = list(style_scores.values())
+    
+    for i, row in hist_df.iterrows():
+        # 取當日最高分
+        scores_today = [row.get(sc, 0) for sc in score_cols]
+        scores_today = [s if pd.notna(s) else 0 for s in scores_today]
+        best_score = max(scores_today) if scores_today else 0
+        price = row.get("close", np.nan)
+        
+        if pd.isna(price):
+            continue
+        
+        if state == 0:  # 空手
+            if best_score >= buy_threshold:
+                # 第一發進場
+                state = 1
+                entry_1 = price
+                entry_1_date = row["date"]
+                entry_2 = 0.0
+                entry_2_date = None
+                avg_cost = price  # 單一成本
+        
+        elif state == 1:  # 持第一發
+            # 檢查是否應該賣出
+            if best_score < sell_threshold:
+                # 全數賣出
+                ret = (price - entry_1) / entry_1 * 100 if entry_1 > 0 else 0.0
+                trades.append(TradeRecord(
+                    entry_date=entry_1_date,
+                    entry_price=entry_1,
+                    exit_date=row["date"],
+                    exit_price=price,
+                    style="dual_bullet",
+                    status="已出清",
+                    return_pct=round(ret, 2),
+                ))
+                state = 0
+                continue
+            
+            # 檢查是否要加碼
+            should_add = False
+            if mode == "dip":
+                # 下跌加碼：價格相較第一發跌超過 drop_pct%
+                pct_change = (price / entry_1 - 1) * 100
+                if pct_change <= drop_pct:
+                    should_add = True
+            elif mode == "breakout":
+                # 順勢突破：分數創近期新高
+                if best_score >= buy_threshold + 10:  # 比分數門檻高10分
+                    should_add = True
+            
+            if should_add:
+                # 第二發加碼
+                state = 2
+                entry_2 = price
+                entry_2_date = row["date"]
+                avg_cost = (entry_1 + entry_2) / 2
+        
+        elif state == 2:  # 滿倉
+            if best_score < sell_threshold:
+                # 全數賣出
+                if avg_cost > 0:
+                    ret = (price - avg_cost) / avg_cost * 100
+                else:
+                    ret = 0.0
+                trades.append(TradeRecord(
+                    entry_date=entry_1_date,
+                    entry_price=entry_1,
+                    entry_price_2=entry_2 if entry_2 > 0 else None,
+                    avg_cost=avg_cost,
+                    exit_date=row["date"],
+                    exit_price=price,
+                    style="dual_bullet",
+                    status="已出清",
+                    return_pct=round(ret, 2),
+                ))
+                state = 0
+                entry_1 = 0.0
+                entry_2 = 0.0
+                avg_cost = 0.0
+    
+    # 期末仍持有
+    if state == 1:
+        last_price = hist_df.iloc[-1].get("close", np.nan)
+        ret = (last_price - entry_1) / entry_1 * 100 if (entry_1 > 0 and pd.notna(last_price)) else 0.0
+        trades.append(TradeRecord(
+            entry_date=entry_1_date,
+            entry_price=entry_1,
+            exit_date=None,
+            exit_price=None,
+            style="dual_bullet",
+            status="持有中",
+            return_pct=round(ret, 2),
+        ))
+    elif state == 2:
+        last_price = hist_df.iloc[-1].get("close", np.nan)
+        ret = (last_price - avg_cost) / avg_cost * 100 if (avg_cost > 0 and pd.notna(last_price)) else 0.0
+        trades.append(TradeRecord(
+            entry_date=entry_1_date,
+            entry_price=entry_1,
+            entry_price_2=entry_2,
+            avg_cost=avg_cost,
+            exit_date=None,
+            exit_price=None,
+            style="dual_bullet",
+            status="持有中",
+            return_pct=round(ret, 2),
+        ))
+    
+    return trades
+
+
+# ============================================================
 # 績效計算
 # ============================================================
 
 def _calc_total_return(trades: List[TradeRecord]) -> float:
-    """計算總報酬率"""
+    """計算總報酬率（已出清平均，無則取持有中）"""
     closed = [t for t in trades if t.status == "已出清"]
     if closed:
         total = sum(t.return_pct for t in closed)
@@ -567,6 +749,22 @@ def _calc_win_rate(trades: List[TradeRecord]) -> float:
         return None
     wins = sum(1 for t in closed if t.return_pct > 0)
     return round(wins / len(closed) * 100, 1)
+
+
+def _calc_realized_return_sum(trades: List[TradeRecord]) -> float:
+    """已實現報酬率總和（已出清交易報酬率加總）"""
+    closed = [t for t in trades if t.status == "已出清"]
+    if not closed:
+        return 0.0
+    return round(sum(t.return_pct for t in closed), 2)
+
+
+def _calc_unrealized_return(trades: List[TradeRecord]) -> Optional[float]:
+    """未實現報酬率（最後一筆持有中交易的報酬率）"""
+    holding = [t for t in trades if t.status == "持有中"]
+    if not holding:
+        return None
+    return round(holding[-1].return_pct, 2)
 
 
 # ============================================================
@@ -601,3 +799,4 @@ if __name__ == "__main__":
     print("  可用函數:")
     print("    run_backtest(df, stock_id, ...) — 單一回測")
     print("    run_dual_backtest(df, stock_id, ..., output_dir=...) — 同時跑積極+保守")
+    print("    _parse_dual_bullet_trades(...) — 50/50 雙彈夾分批建倉策略")
