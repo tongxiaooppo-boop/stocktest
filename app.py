@@ -37,8 +37,15 @@ from core.advisor import get_advice
 from core.trade_manager import generate_trade_advice
 from ai.analyzer import analyze_with_deepseek
 
-# 設定 matplotlib 支援中文
-plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'DejaVu Sans']
+# 設定 matplotlib 支援中文（使用內附 Noto Sans TC 字型）
+import os
+import matplotlib.font_manager as fm
+_font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "NotoSansTC-Regular.otf")
+if os.path.exists(_font_path):
+    fm.fontManager.addfont(_font_path)
+    plt.rcParams['font.family'] = fm.FontProperties(fname=_font_path).get_name()
+else:
+    plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ===== 中英欄位對照表（用於細目中文顯示 + 除錯面板） =====
