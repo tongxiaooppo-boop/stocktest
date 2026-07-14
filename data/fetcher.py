@@ -34,6 +34,9 @@ def _fetch_finmind(dataset: str, stock_id: str, start_date: str, end_date: str, 
     Returns:
         DataFrame 或空的 DataFrame（若無資料或發生錯誤）
     """
+    # 每次 API 請求前強制延遲 1.5 秒，避免雲端 IP 被 FinMind 限流
+    time.sleep(1.5)
+    
     params = {
         "dataset": dataset,
         "data_id": stock_id,
