@@ -306,8 +306,10 @@ git init
 git add .
 git commit -m "v1.6 初始上傳"
 
-# 連到 GitHub（把 YOUR_USER 換成你的 GitHub 帳號）
+# 連到 GitHub — 如果出現 remote origin already exists，改用 set-url
 git remote add origin https://github.com/YOUR_USER/tw-stock-analyzer.git
+# 如果上面那行報錯，改執行這行：
+git remote set-url origin https://github.com/YOUR_USER/tw-stock-analyzer.git
 
 # 上傳
 git push -u origin main
