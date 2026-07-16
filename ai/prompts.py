@@ -265,10 +265,16 @@ def build_user_message(
     for style_key, style_data in scores.items():
         sname = style_names.get(style_key, style_key)
         total = style_data.get("total", 0)
+        total_buy = style_data.get("total_buy", total)
+        total_sell = style_data.get("total_sell", None)
         breakdown = style_data.get("breakdown", {})
         modifiers = style_data.get("modifiers", {})
         
-        msg += f"■ {sname}：{total} 分\n"
+        # 短線/波段顯示買入+賣出雙軌評分
+        if style_key in ("short_term", "swing") and total_sell is not None:
+            msg += f"■ {sname}：買入 {total_buy} 分 | 賣出 {total_sell} 分（買賣分差 {total_buy - total_sell} 分）\n"
+        else:
+            msg += f"■ {sname}：{total} 分\n"
         
         # 子項明細
         for sub_key, sub_score in breakdown.items():
@@ -422,6 +428,37 @@ def build_backtest_user_message(
         wr_str = f"{wr:.1f}%" if wr is not None else "N/A"
         msg += f"  {scn}: {tc}筆交易 | 總報酬 {ret:+.2f}% | 勝率 {wr_str}\n"
     msg += "\n"
+    
+    # ===== 1.5 賣出評分雙軌資訊（若有賣出評分欄位） =====
+    signal_history = bt_result.signal_history
+    if signal_history is not None and not signal_history.empty:
+        sell_cols = [c for c in signal_history.columns if "_score_sell" in c]
+        if sell_cols:
+            msg += "【賣出評分雙軌資訊（短線/波段買入vs賣出分數對比）】\n"
+            style_sell_map = {
+                "short_term_score_sell": "短線",
+                "swing_score_sell": "波段",
+            }
+            for sell_col in sell_cols:
+                style_cn = style_sell_map.get(sell_col, sell_col)
+                buy_col = sell_col.replace("_score_sell", "_score")
+                if buy_col in signal_history.columns:
+                    # 取最後一筆的買賣分數對比
+                    last_row = signal_history.iloc[-1]
+                    buy_val = last_row.get(buy_col, 0)
+                    sell_val = last_row.get(sell_col, 0)
+                    diff = buy_val - sell_val
+                    msg += f"  {style_cn}: 買入 {buy_val} 分 vs 賣出 {sell_val} 分（差距 {diff:+.0f} 分）\n"
+                    # 簡述差距含義
+                    if diff > 20:
+                        msg += f"    → 買入遠高於賣出，買入條件寬鬆、賣出嚴苛\n"
+                    elif diff > 5:
+                        msg += f"    → 買入略高於賣出，買賣條件略不同步\n"
+                    elif diff > -5:
+                        msg += f"    → 買入與賣出接近一致\n"
+                    else:
+                        msg += f"    → 賣出高於買入，賣出條件比買入寬鬆\n"
+            msg += "\n"
     
     # ===== 2. 所有交易點位（依時間排序，合併所有風格） =====
     signal_history = bt_result.signal_history
