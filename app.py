@@ -43,14 +43,25 @@ from news.fetcher import fetch_news
 from news.analyzer import analyze as analyze_news, get_sentiment_label, get_sentiment_color
 from news.database import save_news, get_historical_sentiment, get_aggregate_sentiment
 
-# 設定 matplotlib 支援中文（使用內附 Noto Sans TC 字型）
+# 設定 matplotlib 支援中文（嘗試 .otf 字型，若失敗則改試 .ttf，最後 fallback 系統字型）
 import matplotlib.font_manager as fm
-_font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "NotoSansTC-Regular.otf")
-if os.path.exists(_font_path):
-    fm.fontManager.addfont(_font_path)
-    plt.rcParams['font.family'] = fm.FontProperties(fname=_font_path).get_name()
-else:
-    plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'DejaVu Sans']
+_font_dir = os.path.dirname(os.path.abspath(__file__))
+_font_candidates = [
+    os.path.join(_font_dir, "NotoSansTC-Regular.otf"),
+    os.path.join(_font_dir, "NotoSansTC-VariableFont_wght.ttf"),
+]
+_font_loaded = False
+for _fp in _font_candidates:
+    if os.path.exists(_fp):
+        try:
+            fm.fontManager.addfont(_fp)
+            plt.rcParams['font.family'] = fm.FontProperties(fname=_fp).get_name()
+            _font_loaded = True
+            break
+        except Exception:
+            continue
+if not _font_loaded:
+    plt.rcParams['font.sans-serif'] = ['Noto Sans TC', 'Microsoft JhengHei', 'SimHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ===== 中英欄位對照表（用於細目中文顯示 + 除錯面板） =====
