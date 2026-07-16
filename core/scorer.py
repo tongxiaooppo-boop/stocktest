@@ -5,9 +5,12 @@ core/scorer.py
 
 import pandas as pd
 import numpy as np
+from stock.metrics import ols_slope, cagr, cv as compute_cv
 from core.scoring_config import (
     SHORT_TERM_WEIGHTS, SHORT_TERM_THRESHOLDS,
+    SHORT_TERM_BUY_WEIGHTS, SHORT_TERM_SELL_WEIGHTS,
     SWING_WEIGHTS, SWING_THRESHOLDS,
+    SWING_BUY_WEIGHTS, SWING_SELL_WEIGHTS,
     VALUE_WEIGHTS, VALUE_THRESHOLDS,
     DIVIDEND_WEIGHTS, DIVIDEND_THRESHOLDS,
     DATA_QUALITY_MODIFIER,
@@ -15,41 +18,19 @@ from core.scoring_config import (
     REVENUE_MA_CROSS,
     OPERATING_MARGIN_QUALITY,
     INDUSTRY_DEBT_BIAS,
+    FINANCE_SECTORS, FINANCE_STOCK_IDS,
+    RSI_OVERHEAT_THRESHOLD, RSI_OVERHEAT_PENALTY,
 )
 
-# ============================================================
-# 金融業防錯與短線過熱放寬
-# ============================================================
-
-# RSI 過熱扣分門檻（原 80，放寬至 88 減少強勢股誤殺）
-RSI_OVERHEAT_THRESHOLD = 88
-RSI_OVERHEAT_PENALTY = -10
-
-# 金融業排除清單（產業名 + 常見金融股代碼）
-FINANCE_SECTORS = ['金融業']
-FINANCE_STOCK_IDS = [
-    '2881', '2882', '2883', '2884', '2885', '2886', '2887', '2888',
-    '2889', '2890', '2891', '2892',
-    '5801', '5802', '5815', '5820', '5836', '5840', '5854',
-    '5863', '5871', '5876', '5880', '6005',
-]
-
 def is_finance(row: dict) -> bool:
-    """判斷 row 是否為金融業（依產業名或股票代碼）
-    
-    支援兩種欄位名稱：'Industry'（人為設定）和 'industry_category'（FinMind API 原始欄位）
-    """
-    # 檢查兩種可能的產業欄位名稱
+    """判斷 row 是否為金融業（依產業名或股票代碼）"""
     industry = row.get("Industry", None)
     if industry is None:
         industry = row.get("industry_category", None)
     if isinstance(industry, str) and industry in FINANCE_SECTORS:
         return True
-    
-    # stock_id 可能為 int/float（2881.0）或 str，需強制轉型避免漏判
     stock_id = row.get("stock_id", None)
     if stock_id is not None and not pd.isna(stock_id):
-        # 強制轉為純數字字串，過濾 2881.0 等 FinMind 髒資料
         if isinstance(stock_id, (int, float)):
             stock_id_str = str(int(float(stock_id)))
         else:
@@ -57,7 +38,7 @@ def is_finance(row: dict) -> bool:
         if stock_id_str in FINANCE_STOCK_IDS:
             return True
         if stock_id_str.startswith("28") and len(stock_id_str) == 4:
-            return True  # 2xxx 開頭四位數為金融保險類股
+            return True
     return False
 
 
@@ -67,16 +48,16 @@ def is_finance(row: dict) -> bool:
 
 def five_level_score(value, thresholds, reverse=False):
     """
-    五級評分通用函式
+    五級評分通用函式（v2.0 平滑映射：100/85/70/50/0）
     
     Parameters:
         value: 實際數值
         thresholds: dict 包含 _excellent, _good, _normal, _weak, _poor 門檻
-                    所有 key 皆為可選（若缺少則跳過該級別）
+                     所有 key 皆為可選（若缺少則跳過該級別）
         reverse: True 表示數值越低越好（反向評分）
     
     Returns:
-        int: 100, 80, 60, 30, 0
+        int: 100, 85, 70, 50, 0
     """
     if pd.isna(value):
         return 0
@@ -93,11 +74,11 @@ def five_level_score(value, thresholds, reverse=False):
         if has_excellent and value <= thresholds["_excellent"]:
             return 100
         if has_good and value <= thresholds["_good"]:
-            return 80
+            return 85
         if has_normal and value <= thresholds["_normal"]:
-            return 60
+            return 70
         if has_weak and value <= thresholds["_weak"]:
-            return 30
+            return 50
         if has_poor and value <= thresholds["_poor"]:
             return 0
         # 若數值大於所有已定義門檻（例如 pe_percentile=93.2 超過 weak=80），一律視為最差
@@ -107,11 +88,11 @@ def five_level_score(value, thresholds, reverse=False):
         if has_excellent and value >= thresholds["_excellent"]:
             return 100
         elif has_good and value >= thresholds["_good"]:
-            return 80
+            return 85
         elif has_normal and value >= thresholds["_normal"]:
-            return 60
+            return 70
         elif has_weak and value >= thresholds["_weak"]:
-            return 30
+            return 50
         elif has_poor and value >= thresholds["_poor"]:
             return 0
         else:
@@ -138,69 +119,53 @@ def get_data_quality_modifier(data_years):
         return DATA_QUALITY_MODIFIER["poor"]["modifier"]
 
 
-def apply_risk_modifier(row, base_score, style):
+def apply_all_modifiers(base_score: int, row: dict, style: str,
+                         dq_modifier: float = 1.0,
+                         industry_bias_adjust: int = None) -> int:
     """
-    計算 Risk Modifier（Penalty + Bonus）
+    v2.1 統一 Modifier 疊加邏輯。
     
-    - RSI 過熱門檻放寬至 88（原 80），減少強勢股誤殺
-    - 金融業跳過負債過高與營業現金流的扣分
+    計算順序：
+      最終分數 = (base_score × DQ_Modifier) - Risk_Penalty + Risk_Bonus
+      若有 Industry_Debt_Bias，則在 Risk 之後再套用
     
-    Returns:
-        int: 調整後的最終分數（限制 0-100）
+    最後用 np.clip 確保 [0, 100]。
     """
-    total_adjustment = 0
+    score = base_score
+    
+    # 1. Data Quality Modifier（乘）
+    score = int(round(score * dq_modifier))
+    
+    # 2. Industry Debt Bias（若有，另乘）
+    if industry_bias_adjust is not None:
+        score = industry_bias_adjust
+    
+    # 3. Risk Modifier（僅含非 RSI 風險因子）
     _fin = is_finance(row)
+    penalty = 0
+    bonus = 0
     
-    # === Penalty ===
-    # RSI 過熱（動態門檻：多頭排列時放寬至 95，減少強勢股誤殺）
-    rsi = row.get("RSI_6", 50)
-    _rsi_threshold = RSI_OVERHEAT_THRESHOLD  # 預設 88
-    if style in ("short_term", "swing"):
-        _is_bull = (
-            pd.notna(row.get("close", 0)) and
-            pd.notna(row.get("MA_5", 0)) and
-            pd.notna(row.get("MA_10", 0)) and
-            pd.notna(row.get("MA_20", 0)) and
-            row["close"] > row["MA_5"] and
-            row["MA_5"] > row["MA_10"] and
-            row["MA_10"] > row["MA_20"]
-        )
-        if _is_bull:
-            _rsi_threshold = 95  # 多頭排列時放寬至 95
-    if pd.notna(rsi) and rsi > _rsi_threshold:
-        total_adjustment += RSI_OVERHEAT_PENALTY
-    
-    # 負債過高（v5.1：金融業跳過）
-    debt = row.get("Debt_Ratio", 0)
-    if not _fin and pd.notna(debt) and debt > RISK_PENALTY["debt_too_high"]["threshold"]:
-        total_adjustment += RISK_PENALTY["debt_too_high"]["penalty"]
-    
-    # TTM EPS < 0
-    ttm_eps = row.get("TTM_EPS", 0)
+    # Penalty
+    debt = row.get("Debt_Ratio", None)
+    if pd.notna(debt) and not _fin and debt > RISK_PENALTY["debt_too_high"]["threshold"]:
+        penalty += RISK_PENALTY["debt_too_high"]["penalty"]
+    ttm_eps = row.get("TTM_EPS", None)
     if pd.notna(ttm_eps) and ttm_eps < 0:
-        total_adjustment += RISK_PENALTY["eps_negative"]["penalty"]
-    
-    # 盈餘品質不佳（v5.1：金融業跳過營業現金流檢查）
-    ttm_ocf = row.get("TTM_OCF", 0)
-    payout = row.get("Payout_Ratio", 0)
+        penalty += RISK_PENALTY["eps_negative"]["penalty"]
+    ttm_ocf = row.get("TTM_OCF", None)
+    payout = row.get("Payout_Ratio", None)
     if not _fin and pd.notna(ttm_ocf) and pd.notna(payout) and ttm_ocf < 0 and payout > 100:
-        total_adjustment += RISK_PENALTY["payout_unsustainable"]["penalty"]
-
+        penalty += RISK_PENALTY["payout_unsustainable"]["penalty"]
     
-    # === Bonus ===
-    # RSI 超賣
+    # Bonus
+    rsi = row.get("RSI_6", None)
     if pd.notna(rsi) and rsi < RISK_BONUS["rsi_oversold"]["threshold"]:
-        total_adjustment += RISK_BONUS["rsi_oversold"]["bonus"]
+        bonus += RISK_BONUS["rsi_oversold"]["bonus"]
+    if pd.notna(debt) and not _fin and debt < RISK_BONUS["low_debt"]["threshold"]:
+        bonus += RISK_BONUS["low_debt"]["bonus"]
     
-    # 低負債（v5.1：金融業跳過）
-    if not _fin and pd.notna(debt) and debt < RISK_BONUS["low_debt"]["threshold"]:
-        total_adjustment += RISK_BONUS["low_debt"]["bonus"]
-    
-    # 計算最終分數
-    final_score = base_score + total_adjustment
-    final_score = max(0, min(100, final_score))
-    
-    return int(round(final_score))
+    score = score - abs(penalty) + bonus
+    return int(np.clip(score, 0, 100))
 
 
 # ============================================================
@@ -248,75 +213,69 @@ def score_trend_structure(row) -> dict:
     }
 
 
-def score_momentum(row) -> dict:
-    """動能強度評分（權重20%）"""
-    t = SHORT_TERM_THRESHOLDS
+def score_momentum(row, rsi_limit: int = 88) -> dict:
+    """
+    動能強度評分（權重20%）
     
-    # RSI 位置
-    rsi = row.get("RSI_6", 50)
-    if pd.isna(rsi):
-        rsi_score = 0
-    elif rsi < t["rsi_oversold"]:
-        rsi_score = 30  # 超賣區，動能弱但可能是反轉機會
-    elif rsi < t["rsi_mid"]:
-        rsi_score = 60  # 中性偏弱
-    elif rsi < t["rsi_strong"]:
-        rsi_score = 80  # 動能良好
-    elif rsi < t["rsi_overheat"]:
-        rsi_score = 100  # 動能強勁
+    Phase 2 重構：以 RSI(6) + 距離高點比例 Dist_High_5D 雙條件，
+    套用新五級分 [100, 85, 70, 50, 0]。
+    
+    RSI 過熱門檻由 rsi_limit 動態控制（均線護航機制）：
+    - MA_Alignment >= 3（完全多頭排列）：rsi_limit = 95
+    - 否則：rsi_limit = 88
+    
+    100分: RSI(6) ∈ [65, 80] 且 距離高點 ≤ 1.5%
+    85分:  RSI(6) ∈ [50, 65) 且 MACD柱 > 0
+    70分:  RSI(6) ∈ [50, 80) (中性偏強)
+    50分:  RSI(6) < 50 且 距離高點 > 5% (超賣)
+    0分:   跌破前5日最低點 或 RSI ≥ rsi_limit (過熱)
+    """
+    rsi = row.get("RSI_6", None)
+    close = row.get("close", None)
+    high_5d = row.get("High_5D", None)
+    low_5d = row.get("Low_5D", None)
+    macd_hist = row.get("MACD_HIST", None)  # MACD 柱狀體
+    
+    # NaN 防禦
+    if pd.isna(rsi) or pd.isna(close):
+        return {
+            "score": 0,
+            "details": {"rsi": None, "note": "RSI 或 close 資料不足"}
+        }
+    
+    # 距離高點比例 Dist_High_5D = (close - max(high[-5:])) / close
+    dist_high = None
+    if pd.notna(close) and abs(close) > 1e-10 and pd.notna(high_5d) and high_5d > 0:
+        dist_high = (close - high_5d) / close * 100  # 百分比
+    
+    # 跌破前5日最低點
+    break_low = pd.notna(low_5d) and close < low_5d
+    
+    # MACD 柱 > 0
+    macd_positive = pd.notna(macd_hist) and macd_hist > 0
+    
+    # 核心評分
+    if break_low or rsi >= rsi_limit:
+        score = 0
+    elif 65 <= rsi <= 80 and pd.notna(dist_high) and dist_high >= -1.5:
+        score = 100
+    elif 50 <= rsi < 65 and macd_positive:
+        score = 85
+    elif 50 <= rsi < 80:
+        score = 70
+    elif rsi < 50 and pd.notna(dist_high) and dist_high < -5:
+        score = 50  # 超賣
     else:
-        rsi_score = 60  # 過熱區，風險增加
-    
-    # MACD 狀態（門檻讀取 config）
-    close = row.get("close", 0)
-    ma5 = row.get("MA_5", 0)
-    ma20 = row.get("MA_20", 0)
-    if pd.notna(close) and pd.notna(ma5) and pd.notna(ma20):
-        macd_line = ma5 - ma20  # 簡化 MACD 計算
-        macd_score = five_level_score(macd_line, {
-            "_excellent": t["macd_excellent"],
-            "_good": t["macd_good"],
-            "_normal": t["macd_normal"],
-            "_weak": t["macd_weak"],
-        })
-        # 若 MACD > 0 且價格站上短期均線，升級為 Excellent
-        if macd_line > 0 and close > ma5:
-            macd_score = max(macd_score, 100)
-    else:
-        macd_score = 0
-    
-    # 突破前高（門檻讀取 config）
-    high_20d = row.get("High_20D", None)
-    if high_20d is None and "close" in row:
-        # 如果沒有 High_20D，嘗試用 rolling max 計算
-        pass
-    if pd.notna(high_20d) and pd.notna(close):
-        # 計算突破天數：close 站上 N 日高點
-        break_days = 0
-        if close >= high_20d:
-            break_days = 3  # 突破20日高點
-        elif close >= row.get("High_10D", close):
-            break_days = 2  # 突破10日高點
-        elif close >= row.get("High_5D", close):
-            break_days = 1  # 突破5日高點
-        break_score = five_level_score(break_days, {
-            "_excellent": t["break_high_excellent"],
-            "_good": t["break_high_good"],
-            "_normal": t["break_high_normal"],
-        })
-    else:
-        break_score = 60  # 無資料給中間分
-    
-    # 綜合評分（RSI 40%, MACD 35%, 突破 25%）
-    composite = rsi_score * 0.40 + macd_score * 0.35 + break_score * 0.25
+        score = 50  # 偏弱但未破底
     
     return {
-        "score": int(round(composite)),
+        "score": score,
         "details": {
-            "rsi": round(rsi, 1) if pd.notna(rsi) else None,
-            "rsi_score": rsi_score,
-            "macd_score": macd_score,
-            "break_score": break_score,
+            "rsi": round(rsi, 1),
+            "dist_high_5d": round(dist_high, 2) if pd.notna(dist_high) else None,
+            "break_low_5d": break_low,
+            "macd_positive": macd_positive,
+            "note": "Phase 2: RSI(6) + Dist_High_5D 雙條件評分"
         }
     }
 
@@ -375,13 +334,14 @@ def score_institutional(row) -> dict:
         "_weak": t["inst_5d_weak"],
     })
     
-    # 10日法人（因資料源無 Inst_10D_Net，用 Inst_20D_Net 近似代替）
-    inst_10d = row.get("Inst_20D_Net", 0)
-    inst_10d_score = five_level_score(inst_10d, {
-        "_excellent": t["inst_10d_excellent"],
-        "_good": t["inst_10d_good"],
-        "_normal": t["inst_10d_normal"],
-        "_weak": t["inst_10d_weak"],
+    # 20日法人代理（因無 Inst_10D_Net，用 Inst_20D_Net + 專用門檻）
+    # v2.1 校準：使用獨立的 inst_20d_surrogate_* 門檻，不與 10 日門檻共用
+    inst_20d = row.get("Inst_20D_Net", 0)
+    inst_20d_score = five_level_score(inst_20d, {
+        "_excellent": t["inst_20d_surrogate_excellent"],
+        "_good": t["inst_20d_surrogate_good"],
+        "_normal": t["inst_20d_surrogate_normal"],
+        "_weak": t["inst_20d_surrogate_weak"],
     })
     
     # 外資
@@ -402,16 +362,16 @@ def score_institutional(row) -> dict:
         "_weak": t["trust_weak"],
     })
     
-    # 綜合評分（5日法人 35%, 10日法人 25%, 外資 25%, 投信 15%）
-    composite = inst_5d_score * 0.35 + inst_10d_score * 0.25 + foreign_score * 0.25 + trust_score * 0.15
+    # 綜合評分（5日法人 35%, 20日代理 25%, 外資 25%, 投信 15%）
+    composite = inst_5d_score * 0.35 + inst_20d_score * 0.25 + foreign_score * 0.25 + trust_score * 0.15
     
     return {
         "score": int(round(composite)),
         "details": {
             "inst_5d_net": int(inst_5d) if pd.notna(inst_5d) else 0,
             "inst_5d_score": inst_5d_score,
-            "inst_10d_score": inst_10d_score,
-            "inst_10d_is_proxy": True,  # 用 Inst_20D_Net 近似代替 Inst_10D_Net
+            "inst_20d_score": inst_20d_score,
+            "inst_20d_is_proxy": True,  # 用 Inst_20D_Net 代理 Inst_10D_Net
             "foreign_score": foreign_score,
             "trust_score": trust_score,
         }
@@ -464,65 +424,87 @@ def score_chip_health(row) -> dict:
     }
 
 
-def score_volatility_risk(row) -> dict:
-    """波動風險評分（權重10%）— 反向評分：波動越低越好"""
-    t = SHORT_TERM_THRESHOLDS
+def score_volatility_risk(row, rsi_limit: int = 88) -> dict:
+    """
+    波動風險評分（權重10%）— 反向評分：波動越低越好
     
-    # 乖離率（反向評分）
-    bias = row.get("MA60_Bias", 0)
-    bias_score = five_level_score(abs(bias) if pd.notna(bias) else 999, {
-        "_excellent": t["bias_excellent"],
-        "_good": t["bias_good"],
-        "_normal": t["bias_normal"],
-        "_weak": t["bias_weak"],
-    }, reverse=True)
+    Phase 2 重構：使用 Bias_5D + RSI(6) 過熱判定，
+    套用新五級分 [100, 85, 70, 50, 0]。
     
-    # ATR（反向評分）
-    atr = row.get("ATR", 0)
-    if pd.notna(atr) and pd.notna(row.get("close", 0)) and row["close"] > 0:
-        atr_pct = atr / row["close"]
-        atr_score = five_level_score(atr_pct, {
-            "_excellent": t["atr_excellent"],
-            "_good": t["atr_good"],
-            "_normal": t["atr_normal"],
-            "_weak": t["atr_weak"],
-        }, reverse=True)
+    RSI 過熱門檻由 rsi_limit 動態控制（均線護航機制）：
+    - MA_Alignment >= 3（完全多頭排列）：rsi_limit = 95
+    - 否則：rsi_limit = 88
+    
+    100分: Bias_5D ∈ [-2%, 2%] 且 RSI(6) ≤ 80 (低波動安全)
+    85分:  Bias_5D ∈ [-5%, 5%]  (乖離適中)
+    70分:  Bias_5D > 10%         (短線乖離過大)
+    50分:  無過熱但乖離略大
+    0分:   RSI(6) > rsi_limit    (觸發過熱扣分)
+    """
+    bias_5d = row.get("Bias_5D", None)  # 5日乖離率
+    rsi = row.get("RSI_6", None)
+    
+    # NaN 防禦
+    if pd.isna(bias_5d):
+        bias_5d = row.get("MA60_Bias", None)  # fallback to MA60_Bias
+    
+    if pd.isna(rsi):
+        return {
+            "score": 0,
+            "details": {"note": "RSI 資料不足"}
+        }
+    
+    # 核心評分：Bias_5D + RSI 過熱
+    bias_abs = abs(bias_5d) if pd.notna(bias_5d) else 999
+    
+    # RSI 過熱：直接 0 分（使用動態 rsi_limit）
+    if rsi > rsi_limit:
+        score = 0
+    elif pd.notna(bias_5d) and bias_abs <= 0.02 and rsi <= 80:
+        score = 100
+    elif pd.notna(bias_5d) and bias_abs <= 0.05:
+        score = 85
+    elif pd.notna(bias_5d) and bias_abs > 0.10:
+        score = 70  # 乖離過大風險
+    elif rsi <= rsi_limit:
+        score = 50  # 無過熱但乖離略大
     else:
-        atr_score = 60  # 無資料給中間分
-    
-    # RSI 過熱檢查
-    rsi = row.get("RSI_6", 50)
-    if pd.notna(rsi) and rsi > t["rsi_overheat_penalty"]:
-        rsi_penalty = 30  # 過熱扣分
-    else:
-        rsi_penalty = 100  # 無過熱
-    
-    # 綜合評分（乖離率 40%, ATR 30%, RSI 30%）
-    composite = bias_score * 0.40 + atr_score * 0.30 + rsi_penalty * 0.30
+        score = 50
     
     return {
-        "score": int(round(composite)),
+        "score": score,
         "details": {
-            "ma60_bias": round(bias, 4) if pd.notna(bias) else None,
-            "bias_score": bias_score,
-            "atr_score": atr_score,
-            "rsi_penalty_score": rsi_penalty,
+            "bias_5d": round(bias_5d, 4) if pd.notna(bias_5d) else None,
+            "rsi": round(rsi, 1) if pd.notna(rsi) else None,
+            "note": "Phase 2: Bias_5D + RSI(6) 過熱判定評分"
         }
     }
 
 
 def score_short_term(row) -> dict:
-    """計算短線總分與子項明細"""
-    weights = SHORT_TERM_WEIGHTS
+    """
+    計算短線總分與子項明細（雙軌制）
     
+    買入權重：SHORT_TERM_BUY_WEIGHTS（動能/量能權重較高）
+    賣出權重：SHORT_TERM_SELL_WEIGHTS（趨勢/風險權重較高）
+    
+    RSI 過熱門檻由均線護航機制動態控制：
+    - MA_Alignment >= 3（完全多頭排列）：rsi_limit = 95
+    - 否則：rsi_limit = 88
+    """
+    # A. 動態計算 RSI 過熱門檻
+    ma_alignment = row.get("MA_Alignment", 0)
+    rsi_limit = 95 if pd.notna(ma_alignment) and ma_alignment >= 3 else 88
+    
+    # B. 計算 6 個子項（傳入 rsi_limit）
     trend = score_trend_structure(row)
-    momentum = score_momentum(row)
+    momentum = score_momentum(row, rsi_limit)
     volume = score_volume_structure(row)
     inst = score_institutional(row)
     chip = score_chip_health(row)
-    risk = score_volatility_risk(row)
+    risk = score_volatility_risk(row, rsi_limit)
     
-    breakdown = {
+    sub_scores = {
         "trend_structure": trend["score"],
         "momentum": momentum["score"],
         "volume": volume["score"],
@@ -531,21 +513,28 @@ def score_short_term(row) -> dict:
         "risk": risk["score"],
     }
     
-    # 加權計算
-    weighted_total = (
-        trend["score"] * weights["trend_structure"] +
-        momentum["score"] * weights["momentum"] +
-        volume["score"] * weights["volume"] +
-        inst["score"] * weights["institutional"] +
-        chip["score"] * weights["chip"] +
-        risk["score"] * weights["risk"]
+    # C. 雙軌加權計算
+    buy_total = (
+        sub_scores["trend_structure"] * SHORT_TERM_BUY_WEIGHTS["trend_structure"] +
+        sub_scores["momentum"] * SHORT_TERM_BUY_WEIGHTS["momentum"] +
+        sub_scores["volume"] * SHORT_TERM_BUY_WEIGHTS["volume"] +
+        sub_scores["institutional"] * SHORT_TERM_BUY_WEIGHTS["institutional"] +
+        sub_scores["chip"] * SHORT_TERM_BUY_WEIGHTS["chip"] +
+        sub_scores["risk"] * SHORT_TERM_BUY_WEIGHTS["risk"]
+    )
+    sell_total = (
+        sub_scores["trend_structure"] * SHORT_TERM_SELL_WEIGHTS["trend_structure"] +
+        sub_scores["momentum"] * SHORT_TERM_SELL_WEIGHTS["momentum"] +
+        sub_scores["volume"] * SHORT_TERM_SELL_WEIGHTS["volume"] +
+        sub_scores["institutional"] * SHORT_TERM_SELL_WEIGHTS["institutional"] +
+        sub_scores["chip"] * SHORT_TERM_SELL_WEIGHTS["chip"] +
+        sub_scores["risk"] * SHORT_TERM_SELL_WEIGHTS["risk"]
     )
     
-    base_score = int(round(weighted_total))
-    
     return {
-        "total": base_score,
-        "breakdown": breakdown,
+        "total_buy": int(round(buy_total)),
+        "total_sell": int(round(sell_total)),
+        "breakdown": sub_scores,
         "details": {
             "trend_structure": trend["details"],
             "momentum": momentum["details"],
@@ -602,7 +591,7 @@ def score_revenue_momentum(row, cagr_1_5y=None) -> dict:
         accel_score = 0
     
     # 1.5Y-CAGR 評分（v4.2 新增）
-    cagr_score = 60
+    cagr_score = 70
     cagr_value = None
     if cagr_1_5y is not None and pd.notna(cagr_1_5y):
         cagr_score = five_level_score(cagr_1_5y, {
@@ -634,103 +623,112 @@ def score_revenue_momentum(row, cagr_1_5y=None) -> dict:
 
 
 def score_mid_trend(row) -> dict:
-    """中期趨勢評分（權重20%）"""
-    t = SWING_THRESHOLDS
+    """
+    中期趨勢評分（權重20%）
     
-    close = row.get("close", 0)
-    ma20 = row.get("MA_20", 0)
-    ma60 = row.get("MA_60", 0)
+    Phase 2 重構：使用 20MA 斜率 + 站上 MA60 判斷，
+    套用新五級分 [100, 85, 70, 50, 0]。
     
-    # 站上MA20
-    above_ma20 = 1 if (pd.notna(close) and pd.notna(ma20) and close > ma20) else 0
-    ma20_score = five_level_score(above_ma20, {
-        "_excellent": t["above_ma20_excellent"],
-    })
+    100分: MA20_Slope > 0 且 close > MA60 (中期多頭)
+    85分:  MA20_Slope > 0 (20MA 向上)
+    70分:  close > MA60 (股價在年線之上)
+    50分:  close > MA20 (股價在月線之上)
+    0分:   close ≤ MA20 (短期偏空)
+    """
+    close = row.get("close", None)
+    ma20 = row.get("MA_20", None)
+    ma60 = row.get("MA_60", None)
+    ma20_slope = row.get("MA20_Slope", None)  # OLS 斜率，由 processor 計算
     
-    # 站上MA60
-    above_ma60 = 1 if (pd.notna(close) and pd.notna(ma60) and close > ma60) else 0
-    ma60_score = five_level_score(above_ma60, {
-        "_excellent": t["above_ma60_excellent"],
-    })
+    # NaN 防禦
+    if pd.isna(close):
+        return {
+            "score": 0,
+            "details": {"note": "close 資料不足"}
+        }
     
-    # MA20乖離
-    if pd.notna(close) and pd.notna(ma20) and ma20 > 0:
-        ma20_bias = abs((close - ma20) / ma20)
-        ma20_bias_score = five_level_score(ma20_bias, {
-            "_excellent": t["ma20_bias_excellent"],
-            "_good": t["ma20_bias_good"],
-            "_normal": t["ma20_bias_normal"],
-            "_weak": t["ma20_bias_weak"],
-        }, reverse=True)
+    # 核心評分：MA20 斜率 + 站上均線
+    above_ma20 = pd.notna(ma20) and close > ma20
+    above_ma60 = pd.notna(ma60) and close > ma60
+    ma20_up = pd.notna(ma20_slope) and ma20_slope > 0
+    
+    if ma20_up and above_ma60:
+        score = 100
+    elif ma20_up:
+        score = 85
+    elif above_ma60:
+        score = 70
+    elif above_ma20:
+        score = 50
     else:
-        ma20_bias_score = 0
-    
-    # MA60乖離
-    if pd.notna(close) and pd.notna(ma60) and ma60 > 0:
-        ma60_bias = abs((close - ma60) / ma60)
-        ma60_bias_score = five_level_score(ma60_bias, {
-            "_excellent": t["ma60_bias_excellent"],
-            "_good": t["ma60_bias_good"],
-            "_normal": t["ma60_bias_normal"],
-            "_weak": t["ma60_bias_weak"],
-        }, reverse=True)
-    else:
-        ma60_bias_score = 0
-    
-    # 綜合評分（站上MA20 25%, 站上MA60 25%, MA20乖離 25%, MA60乖離 25%）
-    composite = ma20_score * 0.25 + ma60_score * 0.25 + ma20_bias_score * 0.25 + ma60_bias_score * 0.25
+        score = 0
     
     return {
-        "score": int(round(composite)),
+        "score": score,
         "details": {
             "above_ma20": above_ma20,
             "above_ma60": above_ma60,
-            "ma20_bias_score": ma20_bias_score,
-            "ma60_bias_score": ma60_bias_score,
+            "ma20_slope": round(ma20_slope, 6) if pd.notna(ma20_slope) else None,
+            "note": "Phase 2: MA20_Slope + 站上均線評分"
         }
     }
 
 
 def score_institutional_trend(row) -> dict:
-    """籌碼趨勢評分（權重20%）"""
-    t = SWING_THRESHOLDS
+    """
+    籌碼趨勢評分（權重20%）
     
-    # 20日法人
-    inst_20d = row.get("Inst_20D_Net", 0)
-    inst_20d_score = five_level_score(inst_20d, {
-        "_excellent": t["inst_20d_excellent"],
-        "_good": t["inst_20d_good"],
-        "_normal": t["inst_20d_normal"],
-        "_weak": t["inst_20d_weak"],
-    })
+    Phase 2 重構：使用 ols_slope 計算 20 日法人買超斜率，
+    套用新五級分 [100, 85, 70, 50, 0]。
     
-    # 借券趨勢
-    sbl = row.get("SBL_5D_Change", 0)
-    sbl_score = five_level_score(sbl, {
-        "_excellent": t["sbl_trend_excellent"],
-        "_good": t["sbl_trend_good"],
-        "_normal": t["sbl_trend_normal"],
-        "_weak": t["sbl_trend_weak"],
-    }, reverse=True)
+    100分: Inst_Slope_20D ≥ 50000 (顯著正斜率)
+    85分:  Inst_Slope_20D ≥ 0 (正斜率)
+    70分:  Inst_20D_Net ≥ 0 (累計買超)
+    50分:  Inst_20D_Net < 0 但 Inst_Slope_20D > -50000
+    0分:   Inst_20D_Net < 0 且斜率明顯為負
+    """
+    # 嘗試取得 OLS 斜率（data processor 計算後寫入 row）
+    inst_slope = row.get("Inst_Slope_20D", None)
+    inst_20d = row.get("Inst_20D_Net", None)
     
-    # 法人趨勢（連續買超天數）
-    inst_trend = row.get("Inst_Consecutive_Days", 0)
-    inst_trend_score = five_level_score(inst_trend, {
-        "_excellent": t["inst_trend_excellent"],
-        "_good": t["inst_trend_good"],
-        "_normal": t["inst_trend_normal"],
-    })
+    # NaN 防禦
+    if pd.isna(inst_20d):
+        return {
+            "score": 0,
+            "details": {"note": "Inst_20D_Net 資料不足"}
+        }
     
-    # 綜合評分（20日法人 45%, 借券 25%, 法人趨勢 30%）
-    composite = inst_20d_score * 0.45 + sbl_score * 0.25 + inst_trend_score * 0.30
+    # 核心評分：OLS 斜率優先，其次為 20 日累計
+    if pd.notna(inst_slope):
+        if inst_slope >= 50000:
+            score = 100
+        elif inst_slope >= 0:
+            score = 85
+        elif inst_20d >= 0:
+            score = 70
+        elif inst_slope > -50000:
+            score = 50
+        else:
+            score = 0
+    else:
+        # 無 OLS 斜率時，用 20 日累計法人買超替代
+        if inst_20d >= 10000000:
+            score = 100
+        elif inst_20d >= 2000000:
+            score = 85
+        elif inst_20d >= 0:
+            score = 70
+        elif inst_20d >= -2000000:
+            score = 50
+        else:
+            score = 0
     
     return {
-        "score": int(round(composite)),
+        "score": score,
         "details": {
+            "inst_slope_20d": round(inst_slope, 0) if pd.notna(inst_slope) else None,
             "inst_20d_net": int(inst_20d) if pd.notna(inst_20d) else 0,
-            "inst_20d_score": inst_20d_score,
-            "sbl_score": sbl_score,
-            "inst_trend_score": inst_trend_score,
+            "note": "Phase 2: Inst_Slope_20D (OLS斜率) 優先評分"
         }
     }
 
@@ -804,7 +802,7 @@ def score_valuation_position(row) -> dict:
             "_weak": t["pe_percentile_weak"],
         }, reverse=True)
     else:
-        pe_score = 60  # 無資料給中間分
+        pe_score = 70  # 無資料給中間分
     
     # PB Percentile
     pb_pct = row.get("PB_Percentile", None)
@@ -816,7 +814,7 @@ def score_valuation_position(row) -> dict:
             "_weak": t["pb_percentile_weak"],
         }, reverse=True)
     else:
-        pb_score = 60
+        pb_score = 70
     
     # 綜合評分（PE 60%, PB 40%）
     composite = pe_score * 0.60 + pb_score * 0.40
@@ -833,41 +831,53 @@ def score_valuation_position(row) -> dict:
 
 
 def score_catalyst(row) -> dict:
-    """催化因子評分（權重10%）— 資料不存在則略過"""
-    # 催化因子需要外部資料（新聞、公告等）
-    # 目前先用營收動能作為代理指標
-    rev_momentum = row.get("Revenue_Momentum", 0)
-    rev_yoy = row.get("Revenue_YoY", 0)
+    """
+    催化因子評分（權重10%）
     
-    # 如果營收連續加速，視為正面催化
-    if pd.notna(rev_momentum) and rev_momentum > 0:
-        score = 100
-    elif pd.notna(rev_yoy) and rev_yoy > 20:
-        score = 80
-    elif pd.notna(rev_yoy) and rev_yoy > 10:
-        score = 60
-    elif pd.notna(rev_yoy) and rev_yoy > 0:
-        score = 30
+    v2.1 校準：與 revenue_momentum 定量階梯評分區隔，
+    改為「突破性事件」判定：
+    - 若「最新單月營收創近 12 個月新高」→ 100 分
+    - 若「最新月營收連續 3 個月 MoM 持續成長」→ 100 分
+    - 其餘狀況 → 70 分（中性，不扣分）
+    """
+    revenue_momentum = row.get("Revenue_Momentum", None)
+    rev_yoy = row.get("Revenue_YoY", None)
+    
+    # 檢查營收動能：Revenue_Momentum > 0 代表營收持續成長
+    if pd.notna(revenue_momentum) and isinstance(revenue_momentum, (int, float)):
+        if revenue_momentum >= 3:  # 連續 3 個月 MoM 成長
+            score = 100
+            note = "營收連續 3 個月 MoM 成長（突破性動能）"
+        elif revenue_momentum >= 1:
+            score = 100
+            note = "營收持續加速成長（正面催化）"
+        else:
+            score = 70
+            note = "無明顯突破性催化因子"
+    elif pd.notna(rev_yoy) and rev_yoy > 30:
+        score = 85
+        note = "營收 YoY > 30%，強勁成長（正面催化）"
     else:
-        score = 60  # 無明顯催化，給中間分
+        score = 70
+        note = "無明顯突破性催化因子"
     
     return {
         "score": score,
         "details": {
-            "revenue_momentum": int(rev_momentum) if pd.notna(rev_momentum) else 0,
+            "revenue_momentum": int(revenue_momentum) if pd.notna(revenue_momentum) else None,
             "catalyst_score": score,
-            "note": "催化因子目前以營收動能為代理指標" if score == 60 else "有正面催化"
+            "note": note,
         }
     }
 
 
 def score_swing(row, cagr_1_5y=None) -> dict:
-    """計算波段總分與子項明細
+    """計算波段總分與子項明細（雙軌制）
     
     v4.2：接收 cagr_1_5y 傳入 score_revenue_momentum
+    買入權重：SWING_BUY_WEIGHTS（營收/籌碼/催化權重較高）
+    賣出權重：SWING_SELL_WEIGHTS（趨勢/估值權重較高）
     """
-    weights = SWING_WEIGHTS
-    
     rev = score_revenue_momentum(row, cagr_1_5y)
     mid = score_mid_trend(row)
     inst = score_institutional_trend(row)
@@ -875,7 +885,7 @@ def score_swing(row, cagr_1_5y=None) -> dict:
     val = score_valuation_position(row)
     cat = score_catalyst(row)
     
-    breakdown = {
+    sub_scores = {
         "revenue_momentum": rev["score"],
         "mid_trend": mid["score"],
         "institutional_trend": inst["score"],
@@ -884,20 +894,28 @@ def score_swing(row, cagr_1_5y=None) -> dict:
         "catalyst": cat["score"],
     }
     
-    weighted_total = (
-        rev["score"] * weights["revenue_momentum"] +
-        mid["score"] * weights["mid_trend"] +
-        inst["score"] * weights["institutional_trend"] +
-        earn["score"] * weights["earnings_growth"] +
-        val["score"] * weights["valuation"] +
-        cat["score"] * weights["catalyst"]
+    # 雙軌加權計算
+    buy_total = (
+        sub_scores["revenue_momentum"] * SWING_BUY_WEIGHTS["revenue_momentum"] +
+        sub_scores["mid_trend"] * SWING_BUY_WEIGHTS["mid_trend"] +
+        sub_scores["institutional_trend"] * SWING_BUY_WEIGHTS["institutional_trend"] +
+        sub_scores["earnings_growth"] * SWING_BUY_WEIGHTS["earnings_growth"] +
+        sub_scores["valuation"] * SWING_BUY_WEIGHTS["valuation"] +
+        sub_scores["catalyst"] * SWING_BUY_WEIGHTS["catalyst"]
+    )
+    sell_total = (
+        sub_scores["revenue_momentum"] * SWING_SELL_WEIGHTS["revenue_momentum"] +
+        sub_scores["mid_trend"] * SWING_SELL_WEIGHTS["mid_trend"] +
+        sub_scores["institutional_trend"] * SWING_SELL_WEIGHTS["institutional_trend"] +
+        sub_scores["earnings_growth"] * SWING_SELL_WEIGHTS["earnings_growth"] +
+        sub_scores["valuation"] * SWING_SELL_WEIGHTS["valuation"] +
+        sub_scores["catalyst"] * SWING_SELL_WEIGHTS["catalyst"]
     )
     
-    base_score = int(round(weighted_total))
-    
     return {
-        "total": base_score,
-        "breakdown": breakdown,
+        "total_buy": int(round(buy_total)),
+        "total_sell": int(round(sell_total)),
+        "breakdown": sub_scores,
         "details": {
             "revenue_momentum": rev["details"],
             "mid_trend": mid["details"],
@@ -914,88 +932,107 @@ def score_swing(row, cagr_1_5y=None) -> dict:
 # ============================================================
 
 def score_valuation_safety(row) -> dict:
-    """估值安全評分（權重25%）— 反向評分：百分位越低越好"""
-    t = VALUE_THRESHOLDS
+    """
+    估值安全評分（權重15%）
     
-    # PE Percentile
-    pe_pct = row.get("PE_Percentile", None)
-    if pd.notna(pe_pct):
-        pe_score = five_level_score(pe_pct, {
-            "_excellent": t["pe_percentile_excellent"],
-            "_good": t["pe_percentile_good"],
-            "_normal": t["pe_percentile_normal"],
-            "_weak": t["pe_percentile_weak"],
-        }, reverse=True)
-    else:
-        pe_score = 60
+    Phase 2 重構：結合 PE_TTM 絕對值與 PB_Percentile (1200D)，
+    套用新五級分 [100, 85, 70, 50, 0]。
     
-    # PB Percentile
+    100分: PE_TTM ≤ 12 且 PB_Percentile ≤ 20%
+    85分:  PE_TTM ∈ (12, 15] 且 PB_Percentile ≤ 40%
+    70分:  PE_TTM ∈ (15, 20] 或 PB_Percentile ≤ 60%
+    50分:  PE_TTM ∈ (20, 30] 且 PB_Percentile ≤ 80%
+    0分:   PE_TTM > 30 或 PB_Percentile > 80%
+    """
+    pe_ttm = row.get("pe_ratio", None)  # 已由 TTM_EPS 覆蓋
     pb_pct = row.get("PB_Percentile", None)
-    if pd.notna(pb_pct):
-        pb_score = five_level_score(pb_pct, {
-            "_excellent": t["pb_percentile_excellent"],
-            "_good": t["pb_percentile_good"],
-            "_normal": t["pb_percentile_normal"],
-            "_weak": t["pb_percentile_weak"],
-        }, reverse=True)
-    else:
-        pb_score = 60
     
-    composite = pe_score * 0.60 + pb_score * 0.40
+    # 雙條件複合評分
+    if pd.notna(pe_ttm) and pd.notna(pb_pct):
+        if pe_ttm <= 12 and pb_pct <= 20:
+            score = 100
+        elif pe_ttm <= 15 and pb_pct <= 40:
+            score = 85
+        elif pe_ttm <= 20 or pb_pct <= 60:
+            score = 70
+        elif pe_ttm <= 30 and pb_pct <= 80:
+            score = 50
+        else:
+            score = 0
+    elif pd.notna(pe_ttm):
+        # 僅有 PE 時
+        if pe_ttm <= 12:
+            score = 85
+        elif pe_ttm <= 20:
+            score = 70
+        elif pe_ttm <= 30:
+            score = 50
+        else:
+            score = 0
+    elif pd.notna(pb_pct):
+        # 僅有 PB 時
+        if pb_pct <= 20:
+            score = 85
+        elif pb_pct <= 40:
+            score = 70
+        elif pb_pct <= 60:
+            score = 50
+        else:
+            score = 0
+    else:
+        score = 70  # 無資料給中間分
     
     return {
-        "score": int(round(composite)),
+        "score": score,
         "details": {
-            "pe_percentile": round(pe_pct, 1) if pd.notna(pe_pct) else None,
-            "pe_score": pe_score,
+            "pe_ttm": round(pe_ttm, 2) if pd.notna(pe_ttm) else None,
             "pb_percentile": round(pb_pct, 1) if pd.notna(pb_pct) else None,
-            "pb_score": pb_score,
+            "note": "Phase 2: PE_TTM 絕對值 + PB_Percentile 雙條件"
         }
     }
 
 
 def score_profit_quality(row) -> dict:
-    """獲利品質評分（權重20%）"""
-    t = VALUE_THRESHOLDS
+    """
+    獲利品質評分（權重20%）
     
-    # ROE
-    roe = row.get("ROE_TTM", 0)
-    roe_score = five_level_score(roe, {
-        "_excellent": t["roe_excellent"],
-        "_good": t["roe_good"],
-        "_normal": t["roe_normal"],
-        "_weak": t["roe_weak"],
-    })
+    Phase 2 重構：以 ROE_TTM 為核心 + EPS 穩定度（使用 CV 概念），
+    套用新五級分 [100, 85, 70, 50, 0]。
     
-    # ROA
-    roa = row.get("ROA_TTM", 0)
-    roa_score = five_level_score(roa, {
-        "_excellent": t["roa_excellent"],
-        "_good": t["roa_good"],
-        "_normal": t["roa_normal"],
-        "_weak": t["roa_weak"],
-    })
+    100分: ROE_TTM ≥ 15% 且 Gross_Margin ≥ 50%
+    85分:  ROE_TTM ≥ 10% 且 Gross_Margin ≥ 30%
+    70分:  ROE_TTM ≥ 6%
+    50分:  ROE_TTM ≥ 3%
+    0分:   ROE_TTM < 3% 或資料不足
+    """
+    roe = row.get("ROE_TTM", None)
+    gm = row.get("Gross_Margin", None)
     
-    # 毛利率
-    gm = row.get("Gross_Margin", 0)
-    gm_score = five_level_score(gm, {
-        "_excellent": t["gm_excellent"],
-        "_good": t["gm_good"],
-        "_normal": t["gm_normal"],
-        "_weak": t["gm_weak"],
-    })
+    # NaN/0 防禦
+    if pd.isna(roe):
+        return {
+            "score": 0,
+            "details": {"roe": None, "note": "ROE_TTM 資料不足"}
+        }
     
-    # 綜合評分（ROE 45%, ROA 25%, 毛利率 30%）
-    composite = roe_score * 0.45 + roa_score * 0.25 + gm_score * 0.30
+    # 核心評分：ROE_TTM + Gross_Margin 雙條件
+    if roe >= 15 and pd.notna(gm) and gm >= 50:
+        score = 100
+    elif roe >= 10 and pd.notna(gm) and gm >= 30:
+        score = 85
+    elif roe >= 6:
+        score = 70
+    elif roe >= 3:
+        score = 50
+    else:
+        score = 0
     
     return {
-        "score": int(round(composite)),
+        "score": score,
         "details": {
-            "roe": round(roe, 2) if pd.notna(roe) else None,
-            "roe_score": roe_score,
-            "roa_score": roa_score,
+            "roe": round(roe, 2),
             "gross_margin": round(gm, 2) if pd.notna(gm) else None,
-            "gm_score": gm_score,
+            "note": "Phase 2: ROE_TTM + Gross_Margin 雙條件評分"
         }
     }
 
@@ -1157,7 +1194,7 @@ def score_shareholder_return(row) -> dict:
     elif pd.notna(dividend):
         div_score = 0
     else:
-        div_score = 60  # 無資料給中間分
+        div_score = 70  # 無資料給中間分
     
     # 綜合評分（殖利率 60%, 股利 40%）
     composite = yield_score * 0.60 + div_score * 0.40
@@ -1173,8 +1210,34 @@ def score_shareholder_return(row) -> dict:
     }
 
 
+def _redistribute_weights(skip_keys: list, original_weights: dict) -> dict:
+    """
+    金融股權重等比例再分配
+    
+    跳過特定子項後，將其權重等比例分配給其餘子項。
+    
+    Args:
+        skip_keys: 要跳過的子項 key 列表
+        original_weights: 原始權重 dict
+    
+    Returns:
+        新的權重 dict（已排除跳過項目）
+    """
+    total_skip = sum(original_weights.get(k, 0) for k in skip_keys)
+    if total_skip >= 1.0 or total_skip == 0:
+        return {k: v for k, v in original_weights.items() if k not in skip_keys}
+    
+    ratio = 1.0 / (1.0 - total_skip)
+    return {k: v * ratio for k, v in original_weights.items() if k not in skip_keys}
+
+
 def score_value(row, data_years_available: int = 10) -> dict:
-    """計算價值總分與子項明細"""
+    """計算價值總分與子項明細
+    
+    v2.0：金融股跳過財務安全(15%) + 現金流品質(10%)，
+    權重等比例再分配給其餘 4 子項。
+    """
+    is_fin = is_finance(row)
     weights = VALUE_WEIGHTS
     
     val_safety = score_valuation_safety(row)
@@ -1193,14 +1256,24 @@ def score_value(row, data_years_available: int = 10) -> dict:
         "shareholder_return": shareholder["score"],
     }
     
-    weighted_total = (
-        val_safety["score"] * weights["valuation_safety"] +
-        profit["score"] * weights["profit_quality"] +
-        growth["score"] * weights["growth_ability"] +
-        fin_safety["score"] * weights["financial_safety"] +
-        cf["score"] * weights["cash_flow_quality"] +
-        shareholder["score"] * weights["shareholder_return"]
-    )
+    # v2.0：金融股權重再分配
+    if is_fin:
+        skip_keys = ["financial_safety", "cash_flow_quality"]
+        adj_weights = _redistribute_weights(skip_keys, weights)
+        weighted_total = 0
+        for k, w in adj_weights.items():
+            weighted_total += breakdown.get(k, 0) * w
+        finance_note = f"金融股跳過財務安全+現金流品質({sum(weights.get(k,0) for k in skip_keys)*100:.0f}%)，權重等比例再分配"
+    else:
+        weighted_total = (
+            val_safety["score"] * weights["valuation_safety"] +
+            profit["score"] * weights["profit_quality"] +
+            growth["score"] * weights["growth_ability"] +
+            fin_safety["score"] * weights["financial_safety"] +
+            cf["score"] * weights["cash_flow_quality"] +
+            shareholder["score"] * weights["shareholder_return"]
+        )
+        finance_note = None
     
     base_score = int(round(weighted_total))
     
@@ -1208,7 +1281,7 @@ def score_value(row, data_years_available: int = 10) -> dict:
     dq_modifier = get_data_quality_modifier(data_years_available)
     adjusted_score = int(round(base_score * dq_modifier))
     
-    return {
+    result = {
         "total": adjusted_score,
         "breakdown": breakdown,
         "details": {
@@ -1227,6 +1300,11 @@ def score_value(row, data_years_available: int = 10) -> dict:
             }
         }
     }
+    
+    if finance_note:
+        result["modifiers"]["finance_redistribution"] = finance_note
+    
+    return result
 
 
 # ============================================================
@@ -1234,99 +1312,164 @@ def score_value(row, data_years_available: int = 10) -> dict:
 # ============================================================
 
 def score_dividend_record(row) -> dict:
-    """配息紀錄評分（權重25%）"""
-    t = DIVIDEND_THRESHOLDS
+    """
+    配息紀錄評分（權重25%）
     
-    # 連續配息年數
-    div_years = row.get("Dividend_Continuity_Years", 0)
-    continuity_score = five_level_score(div_years, {
-        "_excellent": t["div_continuity_excellent"],
-        "_good": t["div_continuity_good"],
-        "_normal": t["div_continuity_normal"],
-        "_weak": t["div_continuity_weak"],
-    })
+    Phase 2 重構：連續配息年數 + 殖利率雙條件，
+    套用新五級分 [100, 85, 70, 50, 0]。
+    
+    100分: 連續配息 ≥ 10 年 且 殖利率 ≥ 6.0%
+    85分:  連續配息 ≥ 7 年  且 殖利率 ∈ [4.5%, 6.0%)
+    70分:  連續配息 ≥ 5 年  且 殖利率 ∈ [3.0%, 4.5%)
+    50分:  連續配息 < 3 年  或 殖利率 < 3.0%
+    0分:   無配息或資料不足
+    """
+    div_years = row.get("Dividend_Continuity_Years", None)
+    div_yield = row.get("dividend_yield", None)
+    
+    # NaN 防禦
+    if pd.isna(div_years) or div_years == 0:
+        return {
+            "score": 0,
+            "details": {
+                "dividend_continuity_years": 0,
+                "note": "無配息紀錄"
+            }
+        }
+    
+    div_years = int(div_years)
+    
+    # 雙條件評分：年數 + 殖利率
+    if div_years >= 10 and pd.notna(div_yield) and div_yield >= 6.0:
+        score = 100
+    elif div_years >= 7 and pd.notna(div_yield) and div_yield >= 4.5:
+        score = 85
+    elif div_years >= 5 and pd.notna(div_yield) and div_yield >= 3.0:
+        score = 70
+    elif div_years >= 3:
+        score = 50
+    else:
+        score = 0
     
     return {
-        "score": continuity_score,
+        "score": score,
         "details": {
-            "dividend_continuity_years": int(div_years) if pd.notna(div_years) else 0,
-            "continuity_score": continuity_score,
+            "dividend_continuity_years": div_years,
+            "dividend_yield": round(div_yield, 2) if pd.notna(div_yield) else None,
+            "note": "Phase 2: 連續配息年數 + 殖利率雙條件評分"
         }
     }
 
 
 def score_dividend_quality(row) -> dict:
-    """配息品質評分（權重20%）"""
-    t = DIVIDEND_THRESHOLDS
+    """
+    配息品質評分（權重20%）
     
-    # 配息率
+    Phase 2 重構：以配息率區間為核心 + EPS Cover Ratio，
+    套用新五級分 [100, 85, 70, 50, 0]。
+    
+    100分: Payout_Ratio ∈ [60%, 80%] 且 EPS Cover ≥ 2.0
+    85分:  Payout_Ratio ∈ [45%, 60%) 或 EPS Cover ≥ 1.5
+    70分:  Payout_Ratio ∈ [30%, 45%) 或 Payout_Ratio ∈ (80%, 90%]
+    50分:  Payout_Ratio < 30% 或 EPS Cover < 1.0
+    0分:   Payout_Ratio > 90% 或資料不足
+    """
     payout = row.get("Payout_Ratio", None)
-    if pd.notna(payout):
-        # 配息率越接近 60% 越好
-        if payout <= t["payout_ratio_excellent"]:
-            # 低於60%：越高越好
-            payout_score = five_level_score(payout, {
-                "_excellent": t["payout_ratio_excellent"],
-                "_good": t["payout_ratio_good_low"],
-                "_normal": t["payout_ratio_normal_low"],
-                "_weak": t["payout_ratio_weak_low"],
-            })
-        elif payout <= t["payout_ratio_good_high"]:
-            payout_score = 80  # 60-70% 良好
-        elif payout <= t["payout_ratio_normal_high"]:
-            payout_score = 60  # 70-80% 普通
-        elif payout <= t["payout_ratio_weak_high"]:
-            payout_score = 30  # 80-90% 偏弱
-        else:
-            payout_score = 0   # >90% 危險
-    else:
-        payout_score = 0
+    ttm_eps = row.get("TTM_EPS", None)
+    cash_div = row.get("cash_dividend_total", None)
     
-    # EPS Cover
-    ttm_eps = row.get("TTM_EPS", 0)
-    cash_div = row.get("cash_dividend_total", 0)
+    # 計算 EPS Cover
+    eps_cover = None
     if pd.notna(ttm_eps) and pd.notna(cash_div) and cash_div > 0 and ttm_eps > 0:
         eps_cover = ttm_eps / cash_div
-        eps_cover_score = five_level_score(eps_cover, {
-            "_excellent": t["eps_cover_excellent"],
-            "_good": t["eps_cover_good"],
-            "_normal": t["eps_cover_normal"],
-            "_weak": t["eps_cover_weak"],
-        })
-    else:
-        eps_cover_score = 0
     
-    # 綜合評分（配息率 60%, EPS Cover 40%）
-    composite = payout_score * 0.60 + eps_cover_score * 0.40
+    # NaN 防禦：無配息率時直接 0 分
+    if pd.isna(payout):
+        return {
+            "score": 0,
+            "details": {"payout_ratio": None, "note": "配息率資料不足"}
+        }
+    
+    # Phase 2 階梯式評分：配息率區間 + EPS Cover
+    if 60 <= payout <= 80 and pd.notna(eps_cover) and eps_cover >= 2.0:
+        score = 100
+    elif 45 <= payout < 60 or (pd.notna(eps_cover) and eps_cover >= 1.5):
+        score = 85
+    elif 30 <= payout < 45 or 80 < payout <= 90:
+        score = 70
+    elif payout < 30 or (pd.notna(eps_cover) and eps_cover < 1.0):
+        score = 50
+    else:
+        score = 0
     
     return {
-        "score": int(round(composite)),
+        "score": score,
         "details": {
-            "payout_ratio": round(payout, 2) if pd.notna(payout) else None,
-            "payout_score": payout_score,
-            "eps_cover_score": eps_cover_score,
+            "payout_ratio": round(payout, 2),
+            "eps_cover": round(eps_cover, 2) if pd.notna(eps_cover) else None,
+            "note": "Phase 2: 配息率區間 + EPS Cover 雙條件評分"
         }
     }
 
 
 def score_cash_flow_dividend(row) -> dict:
-    """現金流評分（權重20%）"""
-    t = DIVIDEND_THRESHOLDS
+    """
+    現金流評分（權重20%）
     
-    # FCF Cover
-    fcf_cover = row.get("FCF_Coverage", 0)
-    fcf_score = five_level_score(fcf_cover, {
-        "_excellent": t["fcf_cover_excellent"],
-        "_good": t["fcf_cover_good"],
-        "_normal": t["fcf_cover_normal"],
-        "_weak": t["fcf_cover_weak"],
-    })
+    Phase 2 重構：使用現金轉換率 Cash_Conv_Ratio = OCF / NI，
+    套用新五級分 [100, 85, 70, 50, 0]。
+    
+    NI < 0 時直接給 0 分（虧損企業無現金流品質可言）。
+    
+    100分: Cash_Conv_Ratio ≥ 100% 且 FCF_TTM > 0
+    85分:  Cash_Conv_Ratio ∈ [80%, 100%) 且 FCF_TTM > 0
+    70分:  Cash_Conv_Ratio ∈ [50%, 80%)
+    50分:  Cash_Conv_Ratio ∈ [0%, 50%)
+    0分:   Cash_Conv_Ratio < 0% 或 NI < 0 或資料不足
+    """
+    ttm_ocf = row.get("TTM_OCF", None)
+    ttm_ni = row.get("TTM_NetIncome", None)
+    ttm_fcf = row.get("TTM_FCF", None)
+    
+    # NaN/0 防禦：NI < 0 → 0 分
+    if pd.isna(ttm_ni) or ttm_ni <= 0:
+        return {
+            "score": 0,
+            "details": {"note": "TTM_NetIncome <= 0，無法計算現金轉換率"}
+        }
+    
+    # 計算現金轉換率 OCF / NI（NI > 0 已確保）
+    cash_conv = None
+    if pd.notna(ttm_ocf):
+        cash_conv = ttm_ocf / ttm_ni  # 單位：比值
+    
+    # NaN/0 防禦
+    if pd.isna(cash_conv):
+        return {
+            "score": 0,
+            "details": {"note": "TTM_OCF 資料不足"}
+        }
+    
+    # 核心評分：Cash_Conv_Ratio + FCF 正數條件
+    fcf_positive = pd.notna(ttm_fcf) and ttm_fcf > 0
+    
+    if cash_conv >= 1.0 and fcf_positive:
+        score = 100
+    elif cash_conv >= 0.8 and fcf_positive:
+        score = 85
+    elif cash_conv >= 0.5:
+        score = 70
+    elif cash_conv >= 0:
+        score = 50
+    else:
+        score = 0  # cash_conv < 0
     
     return {
-        "score": fcf_score,
+        "score": score,
         "details": {
-            "fcf_coverage": round(fcf_cover, 2) if pd.notna(fcf_cover) else None,
-            "fcf_score": fcf_score,
+            "cash_conv_ratio": round(cash_conv, 2),
+            "fcf_positive": fcf_positive,
+            "note": "Phase 2: 現金轉換率 OCF/NI + FCF 正數條件評分"
         }
     }
 
@@ -1467,7 +1610,12 @@ def score_long_term_growth(row) -> dict:
 
 
 def score_dividend(row, data_years_available: int = 10) -> dict:
-    """計算定存總分與子項明細"""
+    """計算定存總分與子項明細
+    
+    v2.0：金融股跳過現金流(20%) + 財務安全(15%)，
+    權重等比例再分配給其餘 4 子項。
+    """
+    is_fin = is_finance(row)
     weights = DIVIDEND_WEIGHTS
     
     record = score_dividend_record(row)
@@ -1486,14 +1634,24 @@ def score_dividend(row, data_years_available: int = 10) -> dict:
         "long_term_growth": growth["score"],
     }
     
-    weighted_total = (
-        record["score"] * weights["dividend_record"] +
-        quality["score"] * weights["dividend_quality"] +
-        cf["score"] * weights["cash_flow"] +
-        fin_safety["score"] * weights["financial_safety"] +
-        stability["score"] * weights["profit_stability"] +
-        growth["score"] * weights["long_term_growth"]
-    )
+    # v2.0：金融股權重再分配
+    if is_fin:
+        skip_keys = ["cash_flow", "financial_safety"]
+        adj_weights = _redistribute_weights(skip_keys, weights)
+        weighted_total = 0
+        for k, w in adj_weights.items():
+            weighted_total += breakdown.get(k, 0) * w
+        finance_note = f"金融股跳過現金流+財務安全({sum(weights.get(k,0) for k in skip_keys)*100:.0f}%)，權重等比例再分配"
+    else:
+        weighted_total = (
+            record["score"] * weights["dividend_record"] +
+            quality["score"] * weights["dividend_quality"] +
+            cf["score"] * weights["cash_flow"] +
+            fin_safety["score"] * weights["financial_safety"] +
+            stability["score"] * weights["profit_stability"] +
+            growth["score"] * weights["long_term_growth"]
+        )
+        finance_note = None
     
     base_score = int(round(weighted_total))
     
@@ -1501,7 +1659,7 @@ def score_dividend(row, data_years_available: int = 10) -> dict:
     dq_modifier = get_data_quality_modifier(data_years_available)
     adjusted_score = int(round(base_score * dq_modifier))
     
-    return {
+    result = {
         "total": adjusted_score,
         "breakdown": breakdown,
         "details": {
@@ -1520,6 +1678,11 @@ def score_dividend(row, data_years_available: int = 10) -> dict:
             }
         }
     }
+    
+    if finance_note:
+        result["modifiers"]["finance_redistribution"] = finance_note
+    
+    return result
 
 
 # ============================================================
@@ -1747,17 +1910,23 @@ def get_all_scores(df: pd.DataFrame, start_date: str = None, end_date: str = Non
     value_result = score_value(latest, data_years)
     dividend_result = score_dividend(latest, data_years)
     
-    # 套用 Risk Modifier
-    short_total = apply_risk_modifier(latest, short_result["total"], "short_term")
-    swing_total = apply_risk_modifier(latest, swing_result["total"], "swing")
-    value_total = apply_risk_modifier(latest, value_result["total"], "value")
-    dividend_total = apply_risk_modifier(latest, dividend_result["total"], "dividend")
+    # 套用 Unified Modifier（v2.1：含 DQ + Risk，不含 RSI 重複扣分）
+    dq_mod = get_data_quality_modifier(data_years)
+    # 短線/波段為雙軌制，買賣各自套用 Modifier
+    short_total_buy = apply_all_modifiers(short_result["total_buy"], latest, "short_term", dq_mod)
+    short_total_sell = apply_all_modifiers(short_result["total_sell"], latest, "short_term", dq_mod)
+    swing_total_buy = apply_all_modifiers(swing_result["total_buy"], latest, "swing", dq_mod)
+    swing_total_sell = apply_all_modifiers(swing_result["total_sell"], latest, "swing", dq_mod)
+    value_total = apply_all_modifiers(value_result["total"], latest, "value", dq_mod)
+    dividend_total = apply_all_modifiers(dividend_result["total"], latest, "dividend", dq_mod)
     
-    # === v4.2 流血去庫存質檢（短線/波段打8折） ===
+    # === v4.2 流血去庫存質檢（短線/波段打8折，買賣各自打） ===
     if om_quality["triggered"]:
-        short_total = int(round(short_total * OPERATING_MARGIN_QUALITY["short_term_penalty"]))
-        swing_total = int(round(swing_total * OPERATING_MARGIN_QUALITY["swing_penalty"]))
-    
+        short_total_buy = int(round(short_total_buy * OPERATING_MARGIN_QUALITY["short_term_penalty"]))
+        short_total_sell = int(round(short_total_sell * OPERATING_MARGIN_QUALITY["short_term_penalty"]))
+        swing_total_buy = int(round(swing_total_buy * OPERATING_MARGIN_QUALITY["swing_penalty"]))
+        swing_total_sell = int(round(swing_total_sell * OPERATING_MARGIN_QUALITY["swing_penalty"]))
+
     # === v4.2 產業財務去偏誤（價值/定存打85折） ===
     value_bias = apply_industry_debt_bias(latest, value_total, "value", industry_median_debt)
     if value_bias["penalty_applied"]:
@@ -1766,16 +1935,20 @@ def get_all_scores(df: pd.DataFrame, start_date: str = None, end_date: str = Non
     if dividend_bias["penalty_applied"]:
         dividend_total = dividend_bias["adjusted_score"]
     
-    # 構建結果
+    # 構建結果（短線/波段為雙軌制，買/賣分數各自獨立）
     result = {
         "short_term": {
-            "total": short_total,
+            "total": short_total_buy,
+            "total_buy": short_total_buy,
+            "total_sell": short_total_sell,
             "breakdown": short_result["breakdown"],
             "details": short_result["details"],
             "modifiers": {},
         },
         "swing": {
-            "total": swing_total,
+            "total": swing_total_buy,
+            "total_buy": swing_total_buy,
+            "total_sell": swing_total_sell,
             "breakdown": swing_result["breakdown"],
             "details": swing_result["details"],
             "modifiers": {},
@@ -1942,7 +2115,9 @@ def get_historical_scores(
     
     # 為了效率，限制最小起點（至少要有足夠的暖機資料）
     # 短線需要至少 60 筆（MA60），加上財務指標需要更久
-    min_window = max(60, min(n, 120))  # 至少 60 筆，但不要超過總長度
+    # 從第 max(5, n//20) 筆開始，確保至少有 n//20 筆後才產出分數
+    # 降低 min_window 讓回測在資料不長時仍有早期分數可用
+    min_window = max(5, min(n // 5, 60))  # 至少 5 筆，最多 60 筆（約 3 個月）
     
     for i in range(min_window - 1, n):
         # 取出截至 i 的歷史視窗
@@ -1984,16 +2159,22 @@ def get_historical_scores(
         value_result = score_value(row_dict, data_years)
         dividend_result = score_dividend(row_dict, data_years)
         
-        # Risk Modifier
-        short_total = apply_risk_modifier(row_dict, short_result["total"], "short_term")
-        swing_total = apply_risk_modifier(row_dict, swing_result["total"], "swing")
-        value_total = apply_risk_modifier(row_dict, value_result["total"], "value")
-        dividend_total = apply_risk_modifier(row_dict, dividend_result["total"], "dividend")
+        # Unified Modifier（v2.1：含 DQ + Risk，不含 RSI 重複扣分）
+        dq_mod = get_data_quality_modifier(data_years)
+        # 短線/波段為雙軌制，歷史回測使用買入分數
+        short_total_buy = apply_all_modifiers(short_result["total_buy"], row_dict, "short_term", dq_mod)
+        short_total_sell = apply_all_modifiers(short_result["total_sell"], row_dict, "short_term", dq_mod)
+        swing_total_buy = apply_all_modifiers(swing_result["total_buy"], row_dict, "swing", dq_mod)
+        swing_total_sell = apply_all_modifiers(swing_result["total_sell"], row_dict, "swing", dq_mod)
+        value_total = apply_all_modifiers(value_result["total"], row_dict, "value", dq_mod)
+        dividend_total = apply_all_modifiers(dividend_result["total"], row_dict, "dividend", dq_mod)
         
-        # 流血去庫存
+        # 流血去庫存（買賣各自打）
         if om_quality["triggered"]:
-            short_total = int(round(short_total * OPERATING_MARGIN_QUALITY["short_term_penalty"]))
-            swing_total = int(round(swing_total * OPERATING_MARGIN_QUALITY["swing_penalty"]))
+            short_total_buy = int(round(short_total_buy * OPERATING_MARGIN_QUALITY["short_term_penalty"]))
+            short_total_sell = int(round(short_total_sell * OPERATING_MARGIN_QUALITY["short_term_penalty"]))
+            swing_total_buy = int(round(swing_total_buy * OPERATING_MARGIN_QUALITY["swing_penalty"]))
+            swing_total_sell = int(round(swing_total_sell * OPERATING_MARGIN_QUALITY["swing_penalty"]))
         
         # 產業去偏誤
         value_bias = apply_industry_debt_bias(row_dict, value_total, "value", industry_median_debt)
@@ -2005,8 +2186,12 @@ def get_historical_scores(
         
         records.append({
             "date": current_date,
-            "short_term_score": short_total,
-            "swing_score": swing_total,
+            "short_term_score": short_total_buy,
+            "short_term_score_buy": short_total_buy,
+            "short_term_score_sell": short_total_sell,
+            "swing_score": swing_total_buy,
+            "swing_score_buy": swing_total_buy,
+            "swing_score_sell": swing_total_sell,
             "value_score": value_total,
             "dividend_score": dividend_total,
         })

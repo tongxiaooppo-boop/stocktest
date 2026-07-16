@@ -467,7 +467,13 @@ def _handle_no_position(
             ref_line = ma_20
             ref_label = f"月線 ({ma_20:.2f})"
         stop_loss = round(ma_20 * 0.95, 2) if ma_20 else None
-        return TradeAdvice(
+        
+        # 雙軌建議價（v4.4）
+        agg_c, agg_l, agg_h, cons_c, cons_l, cons_h = _calc_dual_entry_prices(
+            close, pe_pct, ma_20, ma_5, swing_score
+        )
+        
+        ta = TradeAdvice(
             action="買進", style="波段",
             entry_price=entry_core,
             entry_price_low=entry_low,
@@ -475,13 +481,16 @@ def _handle_no_position(
             stop_loss=stop_loss,
             current_price=close, reference_ma=ref_line, ma_type="MA_20",
             reason=f"波段 {swing_score}分 > {buy_threshold}，認領波段主升段",
-            message=(
-                f"策略認領：波段主升段。當前營收動能具備續航力，"
-                f"建議在 {ref_label} 附近逢低分批布局"
-                f"（{entry_low:.2f} ~ {entry_high:.2f} 元）。"
-            ),
             risk_level="中",
         )
+        ta = _fill_dual_prices(ta, agg_c, agg_l, agg_h, cons_c, cons_l, cons_h, risk_mode)
+        ta.message = _build_dual_message(
+            "策略認領：波段主升段",
+            f"當前營收動能具備續航力，{ref_label} 附近逢低分批布局",
+            agg_c, agg_l, agg_h, cons_c, cons_l, cons_h,
+            current_price=close,
+        )
+        return ta
 
     # ============================================================
     # 優先級 3：短線 ≥ buy_threshold → 買進（5MA附近，不高於現價）
@@ -503,7 +512,13 @@ def _handle_no_position(
             high_val = round(ma_5 * 1.01, 2) if ma_5 else round(close * 1.01, 2) if close else None
             ref_line = ma_5 if ma_5 else close
             ref_label = f"5MA ({ma_5:.2f})" if ma_5 else f"現價 ({close:.2f})"
-        return TradeAdvice(
+        
+        # 雙軌建議價（v4.4）
+        agg_c, agg_l, agg_h, cons_c, cons_l, cons_h = _calc_dual_entry_prices(
+            close, pe_pct, ma_20, ma_5, short_score
+        )
+        
+        ta = TradeAdvice(
             action="買進", style="短線",
             entry_price=entry_core,
             entry_price_low=low_val,
@@ -511,13 +526,16 @@ def _handle_no_position(
             stop_loss=stop_loss,
             current_price=close, reference_ma=ref_line, ma_type="5MA",
             reason=f"短線 {short_score}分 > {buy_threshold} 且波段 {swing_score}分 < {buy_threshold}，認領短線動能",
-            message=(
-                f"策略認領：中期強勢動能轉折。"
-                f"建議在 {ref_label} 附近建立短線部位，"
-                f"跌破20MA ({ma_20:.2f}) 無條件停損。"
-            ),
             risk_level="中",
         )
+        ta = _fill_dual_prices(ta, agg_c, agg_l, agg_h, cons_c, cons_l, cons_h, risk_mode)
+        ta.message = _build_dual_message(
+            "策略認領：中期強勢動能轉折",
+            f"建議在 {ref_label} 附近建立短線部位，跌破20MA 無條件停損",
+            agg_c, agg_l, agg_h, cons_c, cons_l, cons_h,
+            current_price=close,
+        )
+        return ta
 
     # ============================================================
     # 優先級 4：價值或定存 ≥ buy_threshold → 飛刀濾網分流
@@ -559,31 +577,26 @@ def _handle_no_position(
             )
             return ta
         else:
-            # 優先級 4-A：未破位 → 正常現價買進（不高於現價）
-            if ma_5 is not None and close is not None and close < ma_5:
-                # 現價低於 5MA → 以現價為基準
-                low_val = round(close * 0.97, 2)
-                high_val = round(close * 1.01, 2)
-                entry_core = round(close * 0.99, 2)
-            else:
-                low_val = round(close * 0.98, 2) if close else None
-                high_val = round(close * 1.01, 2) if close else None
-                entry_core = close
-            return TradeAdvice(
+            # 優先級 4-A：未破位 → 雙軌建議價（v4.4）
+            best_s = max(value_score, dividend_score)
+            agg_c, agg_l, agg_h, cons_c, cons_l, cons_h = _calc_dual_entry_prices(
+                close, pe_pct, ma_20, ma_5, best_s
+            )
+            
+            ta = TradeAdvice(
                 action="買進", style=best_style_name,
-                entry_price=entry_core,
-                entry_price_low=low_val,
-                entry_price_high=high_val,
-                stop_loss=None,
-                current_price=close,
+                stop_loss=None, current_price=close,
                 reason=f"{best_style_name}分 > 70 且未觸發飛刀濾網",
-                message=(
-                    f"策略認領：長線安全邊際。"
-                    f"資產品質良好，現價 {close:.2f} 元即可建立基本防禦倉位，"
-                    f"建議買入區間 {low_val:.2f} ~ {high_val:.2f} 元，拉回分批定額買進。"
-                ),
                 risk_level="低",
             )
+            ta = _fill_dual_prices(ta, agg_c, agg_l, agg_h, cons_c, cons_l, cons_h, risk_mode)
+            ta.message = _build_dual_message(
+                "策略認領：長線安全邊際",
+                f"資產品質極佳，具備長線安全邊際，現價 {close:.2f} 元即可建立基本防禦倉位，拉回分批定額買進",
+                agg_c, agg_l, agg_h, cons_c, cons_l, cons_h,
+                current_price=close,
+            )
+            return ta
 
     # ============================================================
     # 優先級 5：最高分介於 50 ~ buy_threshold 之間 → 中性觀望（雙軌）
@@ -640,49 +653,22 @@ def _handle_has_position(
     df: pd.DataFrame,
     risk_mode: str = "保守",
 ) -> TradeAdvice:
-    """已持有狀態：四維度獨立投票機制 + 一票通關 + 鐵盾覆蓋（v4.4 已持有雙軌）"""
-
-    votes = []
-    vote_details = {}
-
-    if close is not None and ma_5 is not None and close > ma_5 and short_score >= 50:
-        votes.append("短線")
-        vote_details["短線"] = f"贊成（收盤{close}>5MA{ma_5}，短線{short_score}分）"
-    else:
-        vote_details["短線"] = "反對"
-
-    if close is not None and ma_20 is not None and close > ma_20 and swing_score >= 55:
-        votes.append("波段")
-        vote_details["波段"] = f"贊成（收盤{close}>20MA{ma_20}，波段{swing_score}分）"
-    else:
-        vote_details["波段"] = "反對"
-
-    is_value_pass = False
-    value_reason = ""
-    if value_score >= 70:
-        is_value_pass = True
-        value_reason = f"贊成（⭐一票通關：價值分數{value_score} >= 70）"
-    elif pe_ratio is not None and pe_ratio < 12 and value_score >= 50:
-        is_value_pass = True
-        value_reason = f"贊成（⭐一票通關：本益比{pe_ratio:.2f} < 12 且價值{value_score}分）"
-    elif pe_pct is not None and pe_pct < 70 and value_score >= 50:
-        is_value_pass = True
-        value_reason = f"贊成（PE百分位{pe_pct:.0f}%未過熱，價值{value_score}分）"
-
-    if is_value_pass:
-        votes.append("價值")
-        vote_details["價值"] = value_reason
-    else:
-        vote_details["價值"] = f"反對（價值{value_score}分，本益比{pe_ratio}）"
-
-    if dividend_score >= 50:
-        votes.append("定存")
-        vote_details["定存"] = f"贊成（定存{dividend_score}分）"
-    else:
-        vote_details["定存"] = f"反對（定存{dividend_score}分）"
-
-    vote_count = len(votes)
-    votes_detail_str = "；".join(f"{k}:{v}" for k, v in vote_details.items())
+    """
+    已持有狀態：雙軌四維度投票（積極60/40 + 保守70/50 並行）
+    
+    同時執行兩種門檻的獨立判斷，最後取保守動作（寧可保守少賺也不要大賠）：
+      - 積極型 (60/40)：買≥60持續持有，賣<40建議賣出
+      - 保守型 (70/50)：買≥70持續持有，賣<50建議賣出
+    
+    各維度獨立建議，最後彙整為綜合持倉判斷：
+      - 4維持有：加碼
+      - 3維持有：持有
+      - 2維持有：持有觀望
+      - 1維持有：減碼
+      - 0維持有：賣出
+    """
+    style_names = {"short_term": "短線", "swing": "波段", "value": "價值", "dividend": "定存"}
+    score_map = {"short_term": short_score, "swing": swing_score, "value": value_score, "dividend": dividend_score}
 
     pnl_str = ""
     if close is not None and average_cost > 0:
@@ -703,187 +689,169 @@ def _handle_has_position(
         if close >= (average_cost * 0.95):
             is_iron_shield = True
 
-    # 4票全贊成 → 至少持有，波段強再加碼
-    if vote_count >= 4:
-        if swing_score > 65:
-            # 4票 + 波段>65：加碼
-            best_score = max(short_score, swing_score, value_score, dividend_score)
-            agg_c, agg_l, agg_h, cons_c, cons_l, cons_h = _calc_dual_entry_prices(
-                close, pe_pct, ma_20, ma_5, best_score
+    def _run_vote(buy_th: int, sell_th: int) -> dict:
+        """對單一門檻執行四維度投票，回傳結果 dict"""
+        holdings = []
+        sell_advises = []
+        details = []
+
+        def _check(s, name):
+            if s >= buy_th:
+                holdings.append(name)
+                return f"{name} {s}分 ✅ 持有"
+            elif s < sell_th:
+                sell_advises.append(name)
+                return f"{name} {s}分 ❌ 建議賣出"
+            else:
+                return f"{name} {s}分 ➡️ 觀察"
+
+        details.append(_check(short_score, "短線"))
+        details.append(_check(swing_score, "波段"))
+
+        # 價值（含一票通關）
+        vnote = f"價值 {value_score}分"
+        is_vhold = value_score >= buy_th
+        if not is_vhold:
+            is_vhold = (
+                (pe_ratio is not None and pe_ratio < 12 and value_score >= 50) or
+                (pe_pct is not None and pe_pct < 70 and value_score >= 50)
             )
-            ta = TradeAdvice(
-                action="加碼", style="波段",
-                stop_loss=round(ma_20 * 0.95, 2) if ma_20 else None,
-                current_price=close,
-                reason=f"四維度投票{vote_count}票，全部看好。細節：{votes_detail_str}",
-                message="",
-                risk_level="低",
-            )
-            ta = _fill_dual_prices(ta, agg_c, agg_l, agg_h, cons_c, cons_l, cons_h, risk_mode)
-            pnl_line = f"【建議逢低加碼】{pnl_str}。四維度全數支持持有，趨勢強烈且全面看好，可適度擴大子彈規模。"
-            ta.message = pnl_line + "\n\n" + _build_dual_message(
-                "📈 加碼區間參考", "依 risk_mode 決定採用哪組建議價",
-                agg_c, agg_l, agg_h, cons_c, cons_l, cons_h,
-                current_price=close,
-            )
-            return ta
+        if is_vhold:
+            holdings.append("價值")
+            vnote += " ✅ 持有"
+        elif value_score < sell_th:
+            sell_advises.append("價值")
+            vnote += " ❌ 建議賣出"
         else:
-            # 4票 + 波段≤65：全數贊成但波段不夠強，繼續持有
-            entry_ref = round(ma_20, 2) if ma_20 else None
-            return TradeAdvice(
-                action="持有", style="波段", current_price=close,
-                entry_price=entry_ref,
-                entry_price_low=round(entry_ref * 0.98, 2) if entry_ref else None,
-                entry_price_high=round(entry_ref * 1.02, 2) if entry_ref else None,
-                reason=f"四維度投票{vote_count}票全數贊成，但波段{swing_score}分未達加碼門檻。細節：{votes_detail_str}",
-                message=(
-                    f"【建議繼續持有】{pnl_str}。"
-                    f"四維度全數支持，趨勢全面看好，切勿過早獲利了結。"
-                    f"待波段分數提升至 65 以上再考慮加碼。"
-                ),
-                risk_level="低",
-            )
+            vnote += " ➡️ 觀察"
+        details.append(vnote)
 
-    if vote_count == 3:
-        entry_ref = round(ma_20, 2) if ma_20 else None
-        add_msg = ""
-        if entry_ref:
-            add_msg = f"若未來股價拉回至月線 {entry_ref} 元附近，可視為右側趨勢的優質補槍點。"
-        # 3票持有 → 雙軌建議價（加碼參考用）
-        best_score = max(short_score, swing_score, value_score, dividend_score)
-        agg_c, agg_l, agg_h, cons_c, cons_l, cons_h = _calc_dual_entry_prices(
-            close, pe_pct, ma_20, ma_5, best_score
-        )
-        ta = TradeAdvice(
-            action="持有", style="波段", current_price=close,
-            entry_price=entry_ref,
-            entry_price_low=round(entry_ref * 0.98, 2) if entry_ref else None,
-            entry_price_high=round(entry_ref * 1.02, 2) if entry_ref else None,
-            reason=f"四維度投票{vote_count}票贊成。細節：{votes_detail_str}",
-            message="",
-            risk_level="低",
-        )
-        ta = _fill_dual_prices(ta, agg_c, agg_l, agg_h, cons_c, cons_l, cons_h, risk_mode)
-        pnl_line = (
-            f"【建議繼續持有】{pnl_str}。"
-            f"四維度中有三維度支持，切勿因恐高心理過早獲利了結，讓利潤持續奔跑。"
-            f"{add_msg}"
-        )
-        ta.message = pnl_line + "\n\n" + _build_dual_message(
-            "📊 補倉區間參考", "若欲逢低加碼，可參考下方雙軌價位",
-            agg_c, agg_l, agg_h, cons_c, cons_l, cons_h,
-            current_price=close,
-        )
-        return ta
+        # 定存
+        dnote = f"定存 {dividend_score}分"
+        if dividend_score >= buy_th:
+            holdings.append("定存")
+            dnote += " ✅ 持有"
+        elif dividend_score < sell_th:
+            sell_advises.append("定存")
+            dnote += " ❌ 建議賣出"
+        else:
+            dnote += " ➡️ 觀察"
+        details.append(dnote)
 
-    if vote_count == 2 and inst_3d_negative:
-        return TradeAdvice(
-            action="減碼", current_price=close,
-            reason=f"四維度投票2票贊成且法人連3日轉負。細節：{votes_detail_str}",
-            message=(
-                f"【建議逢高減碼】{pnl_str}。"
-                f"四維度僅2票支持，且法人連續3日賣超，建議先收回 1/3 ~ 1/2 部位觀望。"
-            ),
-            risk_level="中",
-        )
+        h = len(holdings)
+        s = len(sell_advises)
+        if h >= 4:
+            act, rl = "加碼", "低"
+        elif h == 3:
+            act, rl = "持有", "低"
+        elif h == 2 and inst_3d_negative and is_iron_shield:
+            act, rl = "持有觀望", "低"
+        elif h == 2 and inst_3d_negative:
+            act, rl = "減碼", "中"
+        elif h == 2:
+            act, rl = "持有觀望", "中"
+        elif h == 1 and is_iron_shield:
+            act, rl = "持有觀望", "低"
+        elif h == 1:
+            act, rl = "減碼", "高"
+        else:
+            act, rl = "賣出", "高"
 
-    if vote_count == 2:
-        entry_ref = round(ma_20, 2) if ma_20 else None
-        add_msg = ""
-        if entry_ref:
-            add_msg = (
-                f"當前短線動能偏弱，現價請勿盲目攤平。"
-                f"若欲加碼，建議靜待股價拉回至月線 {entry_ref} 元附近"
-                f"且出現止穩訊號時，再動用新子彈。"
-            )
-        # 2票持有觀望 → 雙軌建議價（保守加碼參考用）
-        best_score = max(short_score, swing_score, value_score, dividend_score)
-        agg_c, agg_l, agg_h, cons_c, cons_l, cons_h = _calc_dual_entry_prices(
-            close, pe_pct, ma_20, ma_5, best_score
-        )
-        ta = TradeAdvice(
-            action="持有觀望", current_price=close,
-            entry_price=entry_ref,
-            entry_price_low=round(entry_ref * 0.98, 2) if entry_ref else None,
-            entry_price_high=round(entry_ref * 1.02, 2) if entry_ref else None,
-            reason=f"四維度投票2票贊成，邊緣持有。細節：{votes_detail_str}",
-            message="",
-            risk_level="中",
-        )
-        ta = _fill_dual_prices(ta, agg_c, agg_l, agg_h, cons_c, cons_l, cons_h, risk_mode)
-        pnl_line = (
-            f"【建議持有觀望】{pnl_str}。"
-            f"四維度僅2票支持，方向尚未明確，建議維持現有部位，密切觀察是否出現賣出訊號。"
-            f"{add_msg}"
-        )
-        ta.message = pnl_line + "\n\n" + _build_dual_message(
-            "📊 觀望區間參考", "現階段不建議積極加碼，可先設定低接觀察單",
-            agg_c, agg_l, agg_h, cons_c, cons_l, cons_h,
-            current_price=close,
-        )
-        return ta
+        return {
+            "action": act,
+            "risk_level": rl,
+            "holdings": holdings,
+            "sell_advises": sell_advises,
+            "details": " | ".join(details),
+            "hold_count": h,
+        }
 
-    if is_iron_shield:
-        entry_ref = round(ma_20, 2) if ma_20 else None
-        add_msg = ""
-        if entry_ref:
-            add_msg = (
-                f"當前短線動能偏弱，現價請勿盲目攤平。"
-                f"若欲加碼，建議靜待股價拉回至月線 {entry_ref} 元附近"
-                f"且出現止穩訊號時，再動用新子彈。"
-            )
-        # 鐵盾 → 雙軌建議價（保守型為主的低接參考）
-        best_score = max(short_score, swing_score, value_score, dividend_score)
-        agg_c, agg_l, agg_h, cons_c, cons_l, cons_h = _calc_dual_entry_prices(
-            close, pe_pct, ma_20, ma_5, best_score
-        )
-        ta = TradeAdvice(
-            action="持有觀望", current_price=close,
-            entry_price=entry_ref,
-            entry_price_low=round(entry_ref * 0.98, 2) if entry_ref else None,
-            entry_price_high=round(entry_ref * 1.02, 2) if entry_ref else None,
-            reason=(
-                f"四維度投票{vote_count}票，但【基本面鐵盾啟動】強制覆蓋。"
-                f"細節：{votes_detail_str}"
-            ),
-            message="",
-            risk_level="低",
-        )
-        ta = _fill_dual_prices(ta, agg_c, agg_l, agg_h, cons_c, cons_l, cons_h, risk_mode)
-        pnl_line = (
-            f"【建議持有觀望】{pnl_str}。"
-            f"雖然技術面破位（僅 {vote_count} 票贊成），"
-            f"但因觸發基本面鐵盾防線且虧損在安全範圍內，"
-            f"系統強制禁止賤賣資產。請抱緊個股，靜待籌碼落底。"
-            f"{add_msg}"
-        )
-        ta.message = pnl_line + "\n\n" + _build_dual_message(
-            "🛡️ 鐵盾低接參考", "基本面無虞，可於保守型價位附近分批低接",
-            agg_c, agg_l, agg_h, cons_c, cons_l, cons_h,
-            current_price=close,
-        )
-        return ta
+    # 雙軌並行：積極 + 保守
+    vote_agg = _run_vote(buy_th=60, sell_th=40)
+    vote_cons = _run_vote(buy_th=70, sell_th=50)
 
-    if vote_count == 1:
-        return TradeAdvice(
-            action="減碼", current_price=close,
-            reason=f"四維度投票1票贊成，鐵盾未啟動。細節：{votes_detail_str}",
-            message=(
-                f"【建議逢高減碼】{pnl_str}。"
-                f"四維度僅1票支持，多數維度已不支持繼續持有，建議收回 1/2 ~ 2/3 部位。"
-            ),
-            risk_level="高",
-        )
+    # 動作優先級表（保守優先：數字越大越保守）
+    action_priority = {"加碼": 1, "持有": 2, "持有觀望": 3, "減碼": 4, "賣出": 5}
+    final_action = vote_agg["action"]
+    final_risk = vote_agg["risk_level"]
+    if action_priority.get(vote_cons["action"], 3) > action_priority.get(final_action, 3):
+        final_action = vote_cons["action"]
+        final_risk = vote_cons["risk_level"]
 
-    return TradeAdvice(
-        action="賣出", current_price=close,
-        reason=f"四維度投票0票贊成，全面看空，鐵盾未啟動。細節：{votes_detail_str}",
-        message=(
-            f"【建議全數賣出】{pnl_str}。"
-            f"四維度全數反對繼續持有（0票），紀律出場，落袋為安。"
-        ),
-        risk_level="高",
+    # 同時顯示兩種門檻的投票結果
+    agg_label = "積極(買≥60/賣<40)"
+    cons_label = "保守(買≥70/賣<50)"
+
+    # 計算雙軌建議價
+    best_score = max(short_score, swing_score, value_score, dividend_score)
+    agg_c, agg_l, agg_h, cons_c, cons_l, cons_h = _calc_dual_entry_prices(
+        close, pe_pct, ma_20, ma_5, best_score
     )
+
+    # 動作標題
+    action_titles = {
+        "加碼": "📈 建議逢低加碼",
+        "持有": "✅ 建議繼續持有",
+        "持有觀望": "👀 建議持有觀望",
+        "減碼": "🔻 建議逢高減碼",
+        "賣出": "🔴 建議全數賣出",
+    }
+    action_title = action_titles.get(final_action, "📊 建議")
+    
+    # 鐵盾標記
+    shield_tag = ""
+    if is_iron_shield and final_action in ("持有觀望", "持有"):
+        shield_tag = "（基本面鐵盾已啟動）"
+
+    ta = TradeAdvice(
+        action=final_action,
+        style=", ".join(vote_cons["holdings"]) if vote_cons["holdings"] else "無",
+        current_price=close,
+        entry_price=cons_c if final_action in ("持有觀望", "持有") else None,
+        entry_price_low=cons_l if final_action in ("持有觀望", "持有") else None,
+        entry_price_high=cons_h if final_action in ("持有觀望", "持有") else None,
+        stop_loss=round(ma_20 * 0.95, 2) if ma_20 and final_action in ("加碼", "持有") else None,
+        reason=f"積極→{vote_agg['action']} | 保守→{vote_cons['action']} | 綜合→{final_action}{shield_tag}",
+        message="",
+        risk_level=final_risk,
+    )
+    ta = _fill_dual_prices(ta, agg_c, agg_l, agg_h, cons_c, cons_l, cons_h, risk_mode)
+    
+    # 建構詳細訊息
+    msg_parts = [
+        f"{action_title}{pnl_str}{shield_tag}",
+        "",
+        f"📋 雙軌四維度投票結果：",
+        f"",
+        f"⚡ {agg_label}：",
+        f"   {vote_agg['details']}",
+        f"   → 結論：{vote_agg['action']}",
+        f"",
+        f"🛡️ {cons_label}：",
+        f"   {vote_cons['details']}",
+        f"   → 結論：{vote_cons['action']}",
+        "",
+        f"➡️ 最終建議：{action_title}",
+    ]
+    
+    if final_action in ("加碼", "持有", "持有觀望"):
+        msg_parts.append("")
+        msg_parts.append(_build_dual_message(
+            "價位區間參考", f"{action_title}，可參考雙軌價位",
+            agg_c, agg_l, agg_h, cons_c, cons_l, cons_h,
+            current_price=close,
+        ))
+    
+    if is_iron_shield and final_action in ("持有觀望", "持有"):
+        msg_parts.append("")
+        msg_parts.append("🛡️ 基本面鐵盾已啟動 — 公司基本面無虞，系統強制禁止賤賣資產。")
+    
+    if inst_3d_negative and final_action in ("減碼",):
+        msg_parts.append("")
+        msg_parts.append("⚠️ 法人連續3日賣超，籌碼面轉弱，建議先收回部分部位。")
+
+    ta.message = "\n".join(msg_parts)
+    return ta
 
 
 if __name__ == "__main__":

@@ -470,5 +470,110 @@ def calculate_financial_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+# ============================================================
+# Phase 1 新增：基礎統計工具函式
+# ============================================================
+
+def ols_slope(y_series, window: int = 20, min_periods: int = 15) -> pd.Series:
+    """
+    計算 rolling OLS 斜率（最小二乘法迴歸斜率）
+    
+    對 y_series 以 window 為滾動視窗，對每個視窗內的資料點
+    (x=0,1,2,...,window-1, y=series_values) 做線性迴歸，
+    取斜率作為該視窗的趨勢強度。
+    
+    Parameters:
+        y_series: pd.Series, 要計算斜率的序列
+        window: int, 滾動視窗大小（預設 20）
+        min_periods: int, 最小資料點數（預設 15）
+    
+    Returns:
+        pd.Series: 每個時間點的 OLS 斜率（NaN 表示資料不足）
+    """
+    import numpy as np
+    
+    def _slope(y):
+        """對一個視窗內的 y 值計算 OLS 斜率"""
+        y_clean = y[~np.isnan(y)]
+        if len(y_clean) < min_periods:
+            return np.nan
+        x = np.arange(len(y_clean))
+        # 使用 np.polyfit 計算斜率（degree=1 回傳 [slope, intercept]）
+        try:
+            slope, _ = np.polyfit(x, y_clean, 1)
+            return slope
+        except (np.linalg.LinAlgError, ValueError):
+            return np.nan
+    
+    return y_series.rolling(window=window, min_periods=min_periods).apply(
+        _slope, raw=False
+    )
+
+
+def cagr(y_series, period: int) -> pd.Series:
+    """
+    計算年複合成長率 CAGR
+    
+    CAGR = (current / past)^(1 / years) - 1
+    
+    Parameters:
+        y_series: pd.Series, 要計算 CAGR 的序列（如月營收、季 EPS）
+        period: int, 往回推的期數（月營收用 12, 季 EPS 用 4）
+    
+    Returns:
+        pd.Series: CAGR 值（百分比，如 0.15 表示 15%）
+                    分母 <= 0 時回傳 NaN
+    """
+    if period <= 0:
+        return pd.Series(np.nan, index=y_series.index)
+    
+    past = y_series.shift(period)
+    
+    # 防禦：分母 <= 0 或 current <= 0 時回傳 NaN
+    valid = (past > 0) & (y_series > 0)
+    result = pd.Series(np.nan, index=y_series.index)
+    result[valid] = (y_series[valid] / past[valid]) ** (1.0 / period) - 1
+    
+    # 限制極端值，避免 inf
+    result = result.replace([np.inf, -np.inf], np.nan)
+    
+    return result
+
+
+def cv(y_series) -> pd.Series:
+    """
+    計算變異係數 CV = σ / μ
+    
+    用 rolling window 計算，window 大小為序列長度的 1/4（至少 4 期）。
+    
+    Parameters:
+        y_series: pd.Series, 要計算 CV 的序列
+    
+    Returns:
+        pd.Series: CV 值（無單位比值）
+                    若平均值絕對值 < 0.05 則回傳 NaN（防止分母過小災難）
+    """
+    import numpy as np
+    
+    n = len(y_series)
+    window = max(4, n // 4)
+    
+    def _cv(y):
+        y_clean = y[~np.isnan(y)]
+        if len(y_clean) < 4:
+            return np.nan
+        mean = np.nanmean(y_clean)
+        std = np.nanstd(y_clean, ddof=1)
+        # 防禦：若平均值接近 0，回傳 NaN
+        if abs(mean) < 0.05:
+            return np.nan
+        return std / mean
+    
+    return y_series.rolling(window=window, min_periods=4).apply(_cv, raw=False)
+
+
 if __name__ == "__main__":
     print("metrics.py v4.2 - 含所有 v4.2 新增運算")
+    print("  - ols_slope(): rolling OLS 斜率")
+    print("  - cagr(): 年複合成長率")
+    print("  - cv(): 變異係數")

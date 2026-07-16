@@ -421,21 +421,55 @@ def calculate_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     
     result = df.copy()
     
-    # === 技術指標 ===
+    # 決定價格基準與成交量基準
+    price_col = "adj_close" if "adj_close" in result.columns else "close"
+    vol_col = "adj_volume" if "adj_volume" in result.columns else ("volume" if "volume" in result.columns else None)
+    
     # MA_5/10/20/60
-    if "close" in result.columns:
-        result["MA_5"] = result["close"].rolling(window=5, min_periods=5).mean()
-        result["MA_10"] = result["close"].rolling(window=10, min_periods=10).mean()
-        result["MA_20"] = result["close"].rolling(window=20, min_periods=20).mean()
-        result["MA_60"] = result["close"].rolling(window=60, min_periods=60).mean()
+    if price_col in result.columns:
+        result["MA_5"] = result[price_col].rolling(window=5, min_periods=5).mean()
+        result["MA_10"] = result[price_col].rolling(window=10, min_periods=10).mean()
+        result["MA_20"] = result[price_col].rolling(window=20, min_periods=20).mean()
+        result["MA_60"] = result[price_col].rolling(window=60, min_periods=60).mean()
         
         # High_5D/10D/20D（打分用：短線壓力位）
-        result["High_5D"] = result["close"].rolling(window=5, min_periods=5).max()
-        result["High_10D"] = result["close"].rolling(window=10, min_periods=10).max()
-        result["High_20D"] = result["close"].rolling(window=20, min_periods=20).max()
+        result["High_5D"] = result[price_col].rolling(window=5, min_periods=5).max()
+        result["High_10D"] = result[price_col].rolling(window=10, min_periods=10).max()
+        result["High_20D"] = result[price_col].rolling(window=20, min_periods=20).max()
+        
+        # Low_5D（Phase 2：短線支撐位，用於 score_momentum 判斷破底）
+        result["Low_5D"] = result[price_col].rolling(window=5, min_periods=5).min()
+        
+        # Dist_High_5D（Phase 2：距離5日高點%，用於 score_momentum）
+        if price_col in result.columns and "High_5D" in result.columns:
+            result["Dist_High_5D"] = (result[price_col] - result["High_5D"]) / result[price_col].replace(0, np.nan) * 100
+        
+        # Bias_5D（Phase 2：5日乖離率，用於 score_volatility_risk）
+        if price_col in result.columns and "MA_5" in result.columns:
+            result["Bias_5D"] = (result[price_col] - result["MA_5"]) / result["MA_5"].replace(0, np.nan)
+        
+        # MACD_HIST（Phase 2：MACD 柱狀體，用於 score_momentum）
+        if price_col in result.columns:
+            ema_12 = result[price_col].ewm(span=12, adjust=False, min_periods=12).mean()
+            ema_26 = result[price_col].ewm(span=26, adjust=False, min_periods=26).mean()
+            result["MACD_DIFF"] = ema_12 - ema_26
+            result["MACD_DEA"] = result["MACD_DIFF"].ewm(span=9, adjust=False, min_periods=9).mean()
+            result["MACD_HIST"] = result["MACD_DIFF"] - result["MACD_DEA"]
+        
+        # MA20_Slope（Phase 2：月線 OLS 斜率，用於 score_mid_trend）
+        if "MA_20" in result.columns:
+            from stock.metrics import ols_slope
+            result["MA20_Slope"] = ols_slope(result["MA_20"], window=20, min_periods=15)
+        
+        # Inst_Slope_20D（Phase 2：法人買超 OLS 斜率，用於 score_institutional_trend）
+        if "Inst_20D_Net" in result.columns:
+            from stock.metrics import ols_slope
+            result["Inst_Slope_20D"] = ols_slope(result["Inst_20D_Net"], window=20, min_periods=15)
     
-    # Vol_MA_5
-    if "volume" in result.columns:
+    # 跨期成交量指標（用 adj_volume 避免分割/減資造成的假爆量）
+    if vol_col is not None:
+        result["Vol_MA_5"] = result[vol_col].rolling(window=5, min_periods=5).mean()
+    elif "volume" in result.columns:
         result["Vol_MA_5"] = result["volume"].rolling(window=5, min_periods=5).mean()
     
     # === 營收 MoM ===

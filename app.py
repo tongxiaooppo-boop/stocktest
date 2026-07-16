@@ -1,5 +1,5 @@
 """
-台股AI個人化決策系統 v1.0
+台股AI個人化決策系統 v2.0
 Streamlit 前端主入口 — 串接真實資料 + 圖表
 
 瀑布流顯示順序：
@@ -29,6 +29,7 @@ from data.fetcher import (
     fetch_stock_info, fetch_taiex_price
 )
 from data.processor import build_universal_base_table, calculate_derived_columns, _pivot_financial_statements
+from data.price_adjuster import PriceAdjuster
 
 from stock.metrics import calculate_technical_indicators, calculate_financial_indicators
 from core.scorer import get_all_scores, get_historical_scores
@@ -155,21 +156,161 @@ FIELD_CN_MAP = {
     "cash_flow_score": "現金流評分",
     "profit_stability_score": "獲利穩定評分",
     "long_term_growth_score": "長期成長評分",
+    # 短線細項原始資料（sub_details）
+    "ma_alignment": "均線排列",
+    "ma_alignment_score": "均線排列評分",
+    "above_ma_count": "站上均線數",
+    "above_ma_score": "站上均線評分",
+    "rsi": "RSI(6)",
+    "dist_high_5d": "距高點比例",
+    "break_low_5d": "破底(5日)",
+    "macd_positive": "MACD柱正",
+    "volume_ratio": "量比",
+    "volume_ratio_score": "量比評分",
+    "surge_score": "爆量評分",
+    "inst_5d_net": "法人5日淨額",
+    "inst_5d_score": "法人5日評分",
+    "inst_20d_score": "法人20日評分",
+    "inst_20d_is_proxy": "20日為代理",
+    "foreign_score": "外資評分",
+    "trust_score": "投信評分",
+    "margin_5d_change": "融資5日變化",
+    "margin_score": "融資評分",
+    "short_5d_change": "融券5日變化",
+    "short_score": "融券評分",
+    "sbl_score": "借券評分",
+    "bias_5d": "5日乖離率",
+    # note 類
+    "note": "備註",
+    # 波段細項原始資料（revenue_momentum）
+    "revenue_yoy": "營收年增率",
+    "yoy_score": "年增率評分",
+    "mom_score": "月增率評分",
+    "accel_score": "加速度評分",
+    "cagr_1_5y": "1.5年CAGR",
+    "cagr_score": "CAGR評分",
+    # 波段細項（mid_trend）
+    "above_ma20": "站上20MA",
+    "above_ma60": "站上60MA",
+    "ma20_slope": "20MA斜率",
+    # 波段細項（institutional_trend）
+    "inst_slope_20d": "法人20日斜率",
+    "inst_20d_net": "法人20日淨額",
+    # 波段細項（earnings_growth）
+    "ttm_eps": "近四季EPS",
+    "eps_score": "EPS評分",
+    "eps_yoy": "EPS年成長率",
+    "eps_yoy_score": "EPS年增評分",
+    "eps_yoy_available": "EPS年增可用",
+    "eps_yoy_note": "EPS年增備註",
+    # 波段細項（valuation）
+    "pe_percentile": "本益比百分位",
+    "pe_score": "本益比評分",
+    "pb_percentile": "淨值比百分位",
+    "pb_score": "淨值比評分",
+    # 波段細項（catalyst）
+    "revenue_momentum": "營收動能",
+    "catalyst_score": "催化評分",
+    # 價值細項（valuation_safety）
+    "pe_ttm": "本益比(TTM)",
+    # 價值細項（profit_quality）
+    "roe": "ROE",
+    "gross_margin": "毛利率",
+    # 價值細項（growth_ability）
+    "rev_score": "營收評分",
+    # 價值細項（financial_safety）
+    "debt_ratio": "負債比",
+    "debt_score": "負債比評分",
+    "current_ratio": "流動比率",
+    "cr_score": "流動比率評分",
+    # 價值細項（cash_flow_quality）
+    "ttm_fcf": "近四季FCF",
+    "fcf_score": "FCF評分",
+    "ocf_score": "營運現金流評分",
+    # 價值細項（shareholder_return）
+    "dividend_yield": "殖利率",
+    "yield_score": "殖利率評分",
+    "dividend": "現金股利",
+    "div_score": "股利評分",
+    # 定存細項（dividend_record）
+    "dividend_continuity_years": "連續配息年數",
+    # 定存細項（dividend_quality）
+    "payout_ratio": "配息率",
+    "eps_cover": "EPS覆蓋率",
+    # 定存細項（cash_flow）
+    "cash_conv_ratio": "現金轉換率",
+    "fcf_positive": "FCF正數",
+    # 定存細項（financial_safety）
+    "interest_coverage": "利息保障倍數",
+    "ic_score": "利息保障評分",
+    # 定存細項（profit_stability）
+    "roe_std": "ROE標準差",
+    "eps_std": "EPS標準差",
+    # 定存細項（long_term_growth）
+    "rev_cagr": "營收CAGR",
+    # modifier 相關
+    "data_quality": "資料品質",
+    "data_years": "資料年數",
+    "modifier": "調整係數",
+    "adjusted_score": "調整後分數",
+    "finance_redistribution": "金融業權重再分配",
 }
 
 def cn(val: str) -> str:
     """將英文欄位名稱轉為中文，若無對照則保留原文"""
     return FIELD_CN_MAP.get(val, val)
 
+
+def _radar_chart(labels: list, values: list, title: str, color: str,
+                 label_weights: list = None) -> plt.Figure:
+    """繪製六邊形雷達圖（支援 6 子項）"""
+    import numpy as np
+    N = len(labels)
+    angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
+    angles += angles[:1]
+    values_closed = values + values[:1]
+    
+    fig, ax = plt.subplots(figsize=(3.8, 3.8), subplot_kw=dict(polar=True))
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_direction(-1)
+    
+    for level in [20, 40, 60, 80, 100]:
+        ax.plot(angles, [level] * len(angles), color='gray', linestyle='--', linewidth=0.5, alpha=0.3)
+    ax.plot(angles, [0] * len(angles), color='gray', linewidth=0.5, alpha=0.5)
+    
+    ax.fill(angles, values_closed, alpha=0.15, color=color)
+    ax.plot(angles, values_closed, color=color, linewidth=2)
+    
+    if label_weights:
+        tick_labels = [f"{l}\n({w}%)" for l, w in zip(labels, label_weights)]
+    else:
+        tick_labels = labels
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(tick_labels, fontsize=8, fontweight='bold')
+    
+    ax.set_ylim(0, 105)
+    ax.set_yticks([20, 40, 60, 80, 100])
+    ax.set_yticklabels(['20', '40', '60', '80', '100'], fontsize=7)
+    
+    ax.set_title(title, fontsize=12, fontweight='bold', pad=18, color=color)
+    plt.tight_layout()
+    return fig
+
+
 st.set_page_config(
-    page_title="台股AI個人化決策系統 v1.0",
+    page_title="台股AI個人化決策系統 v2.0",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("📈 台股AI個人化決策系統 v1.0")
+st.title("📈 台股AI個人化決策系統 v2.0 🕐 盤後版")
 st.caption("⚠️ 免責聲明：本系統僅供個人分析參考，不構成任何投資建議或推薦。使用者應自行審慎評估，投資有盈虧風險，請自負責任。")
+st.caption("📌 **資料更新時間說明（依 FinMind 更新時程，非即時報價）**：")
+st.caption("   📊 **股價收盤價** — 盤後約 **14:30~15:30** 更新（當日收盤）")
+st.caption("   🏦 **三大法人買賣超** — 每日約 **16:00~17:00** 更新")
+st.caption("   💰 **融資融券餘額** — 每日約 **20:00~21:30** 更新（含上櫃）")
+st.caption("   📰 **新聞輿情** — 自動抓取近期公開新聞")
 st.markdown("---")
 
 # ===== 側邊欄 =====
@@ -232,6 +373,40 @@ with st.sidebar:
     st.markdown("---")
     refresh_cache_btn = st.button("🔄 強制刷新資料", type="secondary", use_container_width=True)
     st.caption("清除今日快取，下次分析將重新撈取 FinMind")
+    
+    st.markdown("---")
+    st.markdown("**📚 文件瀏覽**")
+    st.caption("點選後在主畫面顯示")
+    _doc_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs")
+    _doc_files = [
+        ("📘 使用說明書", "USER_GUIDE.md"),
+        ("📖 安裝與設定", "SETUP.md"),
+        ("🏗️ 系統架構", "ARCHITECTURE.md"),
+        ("📊 評分細則", "SCORING.md"),
+        ("📋 改版歷程", "CHANGELOG.md"),
+    ]
+    for _label, _fname in _doc_files:
+        if st.button(_label, use_container_width=True, key=f"doc_btn_{_fname}"):
+            st.session_state["_doc_to_show"] = _fname
+            st.session_state["_doc_to_show_label"] = _label
+
+# ===== 文件瀏覽器（點側邊欄按鈕後顯示在主畫面，放在 st.stop() 之前確保不受影響） =====
+_doc_to_show = st.session_state.get("_doc_to_show", None)
+_doc_to_show_label = st.session_state.get("_doc_to_show_label", "")
+if _doc_to_show:
+    _fpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs", _doc_to_show)
+    if os.path.exists(_fpath):
+        with open(_fpath, "r", encoding="utf-8") as _fh:
+            _content = _fh.read()
+        st.info(f"📖 目前閱讀：**{_doc_to_show_label}**")
+        with st.container():
+            st.markdown(_content)
+        if st.button("❌ 關閉文件", type="secondary"):
+            st.session_state["_doc_to_show"] = None
+            st.rerun()
+        st.markdown("---")
+    else:
+        st.session_state["_doc_to_show"] = None
 
 # ===== 追蹤按鈕點擊事件 =====
 cache_key = f"cache_{stock_id}"
@@ -360,13 +535,22 @@ try:
         cache = st.session_state[cache_key]
         
         # 檢查快取中的 trade_advice 是否為舊版（缺 v4.4 雙軌欄位）
+        # 注意：TradeAdvice 是 dataclass，hasattr 對 agg_entry 永遠 True（有預設值）
+        # 改用檢查 agg_entry 是否為 None 來判斷是否真正有雙軌資料
         old_ta = cache.get("trade_advice", None)
-        if old_ta is not None and not hasattr(old_ta, 'agg_entry'):
-            # 舊版快取，清除後強制重新分析
-            del st.session_state[cache_key]
-            st.session_state["analyzed"] = False
-            st.info("🔄 偵測到舊版快取，正在重新分析以啟用雙軌建議價功能...")
-            _has_cache = False  # 讓程式碼落入下方的 else 重新分析
+        if old_ta is not None:
+            is_old_version = (
+                old_ta.agg_entry is None
+                and old_ta.cons_entry is None
+                and old_ta.action in ("買進",)
+                and "建議價位區間對照" not in (old_ta.message or "")
+            )
+            if is_old_version:
+                # 舊版快取，清除後強制重新分析
+                del st.session_state[cache_key]
+                st.session_state["analyzed"] = False
+                st.info("🔄 偵測到舊版快取，正在重新分析以啟用雙軌建議價功能...")
+                _has_cache = False  # 讓程式碼落入下方的 else 重新分析
         
         if _has_cache:
             base = cache["base"]
@@ -388,6 +572,18 @@ try:
             df_inst = cache.get("df_inst", None)
             df_margin = cache.get("df_margin", None)
             df_ss = cache.get("df_ss", None)
+            
+            # 用最新的個人化持股重新產生 trade_advice（快取中的是舊的）
+            try:
+                trade_advice = generate_trade_advice(
+                    stock_id=stock_id,
+                    df=base,
+                    scores=scores,
+                    current_shares=shares if has_position else 0,
+                    average_cost=avg_price if has_position else 0.0,
+                )
+            except Exception:
+                pass  # 沿用快取中的 trade_advice
             
             # 跳過撈取，直接顯示
             progress_bar.empty()
@@ -454,6 +650,21 @@ try:
         if df_info is not None and not df_info.empty and "industry_category" in df_info.columns:
             base["Industry"] = df_info["industry_category"].iloc[0]
         
+        # === 📌 保留 adj_close（fetch_stock_price 已計算，但 build_universal_base_table 只取 price_cols 丟失了它） ===
+        try:
+            if "adj_close" in df_price.columns:
+                adj_df = df_price[["date", "adj_close", "adj_factor"]].copy()
+                if "adj_volume" in df_price.columns:
+                    adj_df["adj_volume"] = df_price["adj_volume"]
+                adj_df["date"] = pd.to_datetime(adj_df["date"])
+                base["date"] = pd.to_datetime(base["date"])
+                base = base.merge(adj_df, on="date", how="left")
+        except Exception:
+            pass
+
+        # === 📌 過濾髒資料（股價 <= 0 的行會導致 rolling MA 全部崩塌） ===
+        base = base[base["close"] > 0].copy()
+
         # ===== 第 3 段：📊 計算指標 (45-65%) =====
         update_progress(47, "📊 [3/5] 計算衍生欄位（MA、TTM、百分位）...")
         base = calculate_derived_columns(base)
@@ -845,15 +1056,20 @@ try:
             with tab2a:
                 st.markdown("**波段評分權重最高：營收動能 25% + 中期趨勢 20% + 籌碼趨勢 20%**")
                 
-                # 圖表 1: 營收 YoY（從母表，約 1 年區間，日頻走勢）
+                # 圖表 1: 營收 YoY + 股價（從母表，約 1 年區間，日頻走勢）
                 fig_sw1, ax_sw1 = plt.subplots(figsize=(12, 4))
+                ax_sw1b = ax_sw1.twinx()
                 if "Revenue_YoY" in base.columns:
                     ax_sw1.plot(base["date"], base["Revenue_YoY"], label="營收 YoY", color="green", linewidth=1.5)
                     ax_sw1.axhline(y=0, color="gray", linestyle="--", alpha=0.5)
-                ax_sw1.set_title(f"{stock_id} {stock_name} - 營收年增率 YoY（權重 25%）")
+                if "close" in base.columns:
+                    ax_sw1b.plot(base["date"], base["close"], label="收盤價", color="black", linewidth=1, linestyle=":", alpha=0.6)
+                    ax_sw1b.set_ylabel("股價")
                 ax_sw1.set_ylabel("YoY (%)")
-                ax_sw1.legend(loc="best")
+                ax_sw1.legend(loc="upper left")
+                ax_sw1b.legend(loc="upper right")
                 ax_sw1.grid(True, alpha=0.3)
+                ax_sw1.set_title(f"{stock_id} {stock_name} - 營收年增率 YoY + 股價（權重 25%）")
                 plt.tight_layout()
                 st.pyplot(fig_sw1)
                 plt.close()
@@ -916,23 +1132,28 @@ try:
                 st.markdown("**價值評分權重最高：成長能力 30% + 獲利品質 20%**")
                 
                 if df_fin_pivot is not None and not df_fin_pivot.empty:
-                    # 圖表 1: ROE / 毛利率（獲利品質 20%）
+                    # 圖表 1: ROE / 毛利率（獲利品質 20%）+ 股價
                     fig_v1, ax_v1 = plt.subplots(figsize=(12, 4))
+                    ax_v1b = ax_v1.twinx()
                     val_chart1 = {"ROE_TTM": "ROE", "Gross_Margin": "毛利率"}
                     for col, label in val_chart1.items():
                         if col in df_fin_pivot.columns:
                             ax_v1.plot(df_fin_pivot["date"], df_fin_pivot[col], label=label, linewidth=1.5, marker="o", markersize=3)
-                    ax_v1.set_title(f"{stock_id} {stock_name} - ROE / 毛利率（權重 20%）")
+                    if "close" in base.columns:
+                        ax_v1b.plot(base["date"], base["close"], label="收盤價", color="black", linewidth=1, linestyle=":", alpha=0.5)
+                        ax_v1b.set_ylabel("股價")
                     ax_v1.set_ylabel("百分比 (%)")
-                    ax_v1.legend(loc="best")
+                    ax_v1.legend(loc="upper left")
+                    ax_v1b.legend(loc="upper right")
                     ax_v1.grid(True, alpha=0.3)
+                    ax_v1.set_title(f"{stock_id} {stock_name} - ROE / 毛利率 + 股價（權重 20%）")
                     plt.tight_layout()
                     st.pyplot(fig_v1)
                     plt.close()
                     
                     st.markdown("---")
                     
-                    # 圖表 2: TTM EPS + 營收YoY（成長能力 30%）
+                    # 圖表 2: TTM EPS + 營收YoY + 股價（成長能力 30%）
                     fig_v2, ax_v2_1 = plt.subplots(figsize=(12, 4))
                     ax_v2_2 = ax_v2_1.twinx()
                     if "TTM_EPS" in df_fin_pivot.columns:
@@ -940,8 +1161,11 @@ try:
                     ax_v2_1.set_ylabel("TTM EPS", color="blue")
                     if "Revenue_YoY" in base.columns:
                         ax_v2_2.plot(base["date"], base["Revenue_YoY"], label="營收 YoY", color="green", linewidth=1.5, linestyle="--")
-                    ax_v2_2.set_ylabel("營收 YoY (%)", color="green")
-                    ax_v2_1.set_title(f"{stock_id} {stock_name} - TTM EPS 與營收成長（權重 30%）")
+                        ax_v2_2.set_ylabel("營收 YoY (%)", color="green")
+                    # 第三軸：股價（用 ax_v2_1 的 twinx 再疊一次不明智，改用 ax_v2_2 同軸）
+                    if "close" in base.columns:
+                        ax_v2_2.plot(base["date"], base["close"], label="收盤價", color="black", linewidth=0.8, linestyle=":", alpha=0.5)
+                    ax_v2_1.set_title(f"{stock_id} {stock_name} - TTM EPS / 營收 YoY / 股價（權重 30%）")
                     ax_v2_1.legend(loc="upper left")
                     ax_v2_2.legend(loc="upper right")
                     ax_v2_1.grid(True, alpha=0.3)
@@ -1002,7 +1226,7 @@ try:
                 
                 st.markdown("---")
                 
-                # 圖表 2: TTM FCF / 負債比（現金流 20% + 財務安全 15%）
+                # 圖表 2: TTM FCF / 負債比 + 股價（現金流 20% + 財務安全 15%）
                 fig_d2, ax_d2_1 = plt.subplots(figsize=(12, 4))
                 ax_d2_2 = ax_d2_1.twinx()
                 if df_fin_pivot is not None and not df_fin_pivot.empty:
@@ -1010,9 +1234,11 @@ try:
                         ax_d2_1.bar(df_fin_pivot["date"], df_fin_pivot["TTM_FCF"], label="TTM FCF", alpha=0.6, width=30, color="green")
                     if "Debt_Ratio" in df_fin_pivot.columns:
                         ax_d2_2.plot(df_fin_pivot["date"], df_fin_pivot["Debt_Ratio"], label="負債比", color="red", linewidth=1.5, marker="o", markersize=3)
+                if "close" in base.columns:
+                    ax_d2_2.plot(base["date"], base["close"], label="股價", color="black", linewidth=0.8, linestyle=":", alpha=0.5)
+                    ax_d2_2.set_ylabel("負債比 (%) / 股價")
                 ax_d2_1.set_ylabel("TTM FCF", color="green")
-                ax_d2_2.set_ylabel("負債比 (%)", color="red")
-                ax_d2_1.set_title(f"{stock_id} {stock_name} - 自由現金流 / 負債比（權重 20%+15%）")
+                ax_d2_1.set_title(f"{stock_id} {stock_name} - 自由現金流 / 負債比 + 股價（權重 20%+15%）")
                 ax_d2_1.legend(loc="upper left")
                 ax_d2_2.legend(loc="upper right")
                 ax_d2_1.grid(True, alpha=0.3)
@@ -1022,7 +1248,7 @@ try:
                 
                 st.markdown("---")
                 
-                # 圖表 3: PE/PB Percentile + 殖利率（估值安全 + 股東報酬）
+                # 圖表 3: PE/PB + 殖利率 + 股價（估值安全 + 股東報酬）
                 fig_d3, ax_d3_1 = plt.subplots(figsize=(12, 4))
                 ax_d3_2 = ax_d3_1.twinx()
                 if "pe_ratio" in base.columns:
@@ -1031,9 +1257,11 @@ try:
                     ax_d3_1.plot(base["date"], base["pb_ratio"], label="股價淨值比", color="purple", linewidth=1.5, linestyle="--")
                 if "dividend_yield" in base.columns:
                     ax_d3_2.plot(base["date"], base["dividend_yield"], label="殖利率", color="green", linewidth=1.5, linestyle=":")
+                if "close" in base.columns:
+                    ax_d3_2.plot(base["date"], base["close"], label="股價", color="black", linewidth=0.8, linestyle="-.", alpha=0.4)
                 ax_d3_1.set_ylabel("PE / PB", color="red")
-                ax_d3_2.set_ylabel("殖利率 (%)", color="green")
-                ax_d3_1.set_title(f"{stock_id} {stock_name} - 本益比 / 淨值比 / 殖利率")
+                ax_d3_2.set_ylabel("殖利率 (%) / 股價", color="green")
+                ax_d3_1.set_title(f"{stock_id} {stock_name} - 本益比 / 淨值比 / 殖利率 + 股價")
                 ax_d3_1.legend(loc="upper left")
                 ax_d3_2.legend(loc="upper right")
                 ax_d3_1.grid(True, alpha=0.3)
@@ -1075,8 +1303,12 @@ try:
                         bt_dual_mode = st.selectbox("加碼方式", options=["dip", "breakout"], index=0,
                             format_func=lambda x: {"dip": "📉 下跌加碼（回檔第二筆）", "breakout": "📈 順勢突破（新高加碼）"}.get(x, x),
                             key="bt_dual_mode")
-                        bt_dual_drop = st.number_input("下跌加碼門檻（%）：", value=-8.0, step=1.0, key="bt_dual_drop",
-                            help="第一發進場後，價格跌 X% 才打入第二發（僅下跌加碼模式有效）")
+                        bt_dual_drop = st.number_input("加碼門檻（%）：", value=-8.0, step=1.0, key="bt_dual_drop",
+                            help="下跌加碼模式：第一發進場後跌 X% 打入第二發；突破模式：分數高於門檻+10分觸發")
+                    
+                    # 賣出評分雙軌模式（短線/波段）
+                    bt_use_sell_score = st.checkbox("📊 啟用短線/波段賣出評分", value=False, key="bt_use_sell_score",
+                        help="啟用後，短線/波段的賣出訊號使用獨立的賣出評分（total_sell），不看買入評分。CSV仍紀錄買入分數不變。")
                     
                     bt_run = st.button("▶️ 執行回測（雙策略）", type="primary")
                 
@@ -1092,12 +1324,14 @@ try:
                 _bt_dual = st.session_state.get("bt_dual_bullet", False)
                 _bt_dual_mode = st.session_state.get("bt_dual_mode", "dip")
                 _bt_dual_drop = st.session_state.get("bt_dual_drop", -8.0)
+                _bt_use_sell = st.session_state.get("bt_use_sell_score", False)
                 
                 # 每次點擊「執行回測」都重新執行 — 同時跑積極(70/50)和保守(60/40)
                 if bt_run:
                     from core.backtest import run_backtest as _run_backtest
                     db_label = "+ 雙彈夾" if _bt_dual else ""
-                    with st.spinner(f"⏳ 執行回測中（積極 60/40 + 保守 70/50 {db_label}）..."):
+                    sell_label = "+ 賣出評分" if _bt_use_sell else ""
+                    with st.spinner(f"⏳ 執行回測中（積極 60/40 + 保守 70/50 {db_label}{sell_label}）..."):
                         bt_active = _run_backtest(
                             df=base,
                             stock_id=stock_id,
@@ -1109,6 +1343,7 @@ try:
                             dual_bullet=_bt_dual,
                             dual_bullet_mode=_bt_dual_mode,
                             dual_bullet_drop_pct=_bt_dual_drop,
+                            use_sell_score=False,
                         )
                         bt_conservative = _run_backtest(
                             df=base,
@@ -1121,7 +1356,38 @@ try:
                             dual_bullet=_bt_dual,
                             dual_bullet_mode=_bt_dual_mode,
                             dual_bullet_drop_pct=_bt_dual_drop,
+                            use_sell_score=False,
                         )
+                        # 賣出評分版本（如有勾選）
+                        bt_active_sell = None
+                        bt_conservative_sell = None
+                        if _bt_use_sell:
+                            bt_active_sell = _run_backtest(
+                                df=base, stock_id=stock_id,
+                                start_date=bt_start.strftime("%Y-%m-%d"),
+                                end_date=bt_end.strftime("%Y-%m-%d"),
+                                freq=bt_freq,
+                                buy_threshold=60, sell_threshold=40,
+                                strategy="active_sell",
+                                dual_bullet=_bt_dual,
+                                dual_bullet_mode=_bt_dual_mode,
+                                dual_bullet_drop_pct=_bt_dual_drop,
+                                use_sell_score=True,
+                            )
+                            bt_conservative_sell = _run_backtest(
+                                df=base, stock_id=stock_id,
+                                start_date=bt_start.strftime("%Y-%m-%d"),
+                                end_date=bt_end.strftime("%Y-%m-%d"),
+                                freq=bt_freq,
+                                buy_threshold=70, sell_threshold=50,
+                                strategy="conservative_sell",
+                                dual_bullet=_bt_dual,
+                                dual_bullet_mode=_bt_dual_mode,
+                                dual_bullet_drop_pct=_bt_dual_drop,
+                                use_sell_score=True,
+                            )
+                        st.session_state["bt_active_sell"] = bt_active_sell
+                        st.session_state["bt_conservative_sell"] = bt_conservative_sell
                         st.session_state["bt_active"] = bt_active
                         st.session_state["bt_conservative"] = bt_conservative
                         st.session_state["bt_result"] = bt_conservative  # 預設顯示保守
@@ -1177,25 +1443,48 @@ try:
                     
                     st.caption(f"📊 目前顯示：**{strategy_label}** | 買≥{bt_buy} / 賣<{bt_sell}")
                     
-                    # === B. 分數走勢圖 ===
+                    # === B. 分數走勢圖（分三張：短線、波段、價值+定存） ===
                     st.markdown("**📈 四維度分數走勢**")
-                    fig_bt1, ax_bt1 = plt.subplots(figsize=(12, 5))
                     sh = bt.signal_history
                     if not sh.empty and "date" in sh.columns:
-                        ax_bt1.plot(sh["date"], sh["short_term_score"], label="短線", color="red", linewidth=1.5)
-                        ax_bt1.plot(sh["date"], sh["swing_score"], label="波段", color="orange", linewidth=1.5)
-                        ax_bt1.plot(sh["date"], sh["value_score"], label="價值", color="blue", linewidth=1.5)
-                        ax_bt1.plot(sh["date"], sh["dividend_score"], label="定存", color="green", linewidth=1.5)
-                        ax_bt1.axhline(y=bt_buy, color="green", linestyle="--", alpha=0.5, label=f"買入門檻({bt_buy})")
-                        ax_bt1.axhline(y=bt_sell, color="red", linestyle="--", alpha=0.5, label=f"賣出門檻({bt_sell})")
-                        ax_bt1.set_ylabel("分數")
-                        ax_bt1.set_ylim(0, 100)
-                        ax_bt1.legend(loc="best")
-                        ax_bt1.grid(True, alpha=0.3)
-                        ax_bt1.set_title(f"{stock_id} {stock_name}（{strategy_label}） - 歷史評分走勢（{bt.start_date} ~ {bt.end_date}）")
-                        plt.tight_layout()
-                        st.pyplot(fig_bt1)
-                        plt.close()
+                        # 圖1: 短線（若啟用賣出評分，多畫一條虛線）
+                        fig_bt1a, ax1a = plt.subplots(figsize=(12, 3.5))
+                        ax1a.plot(sh["date"], sh["short_term_score"], label="短線（買入評分）", color="red", linewidth=2)
+                        if _bt_use_sell and "short_term_score_sell" in sh.columns:
+                            ax1a.plot(sh["date"], sh["short_term_score_sell"], label="短線（賣出評分）", color="#8B0000", linewidth=1.5, linestyle="--", alpha=0.8)
+                        ax1a.axhline(y=bt_buy, color="green", linestyle="--", alpha=0.5, label=f"買入門檻({bt_buy})")
+                        ax1a.axhline(y=bt_sell, color="red", linestyle="--", alpha=0.5, label=f"賣出門檻({bt_sell})")
+                        ax1a.set_ylabel("分數"); ax1a.set_ylim(0, 100)
+                        ax1a.legend(loc="best"); ax1a.grid(True, alpha=0.3)
+                        ax1a.set_title(f"{stock_id} {stock_name}（{strategy_label}） - 🔴 短線評分走勢")
+                        plt.tight_layout(); st.pyplot(fig_bt1a); plt.close()
+                        
+                        st.markdown("---")
+                        
+                        # 圖2: 波段（若啟用賣出評分，多畫一條虛線）
+                        fig_bt1b, ax1b = plt.subplots(figsize=(12, 3.5))
+                        ax1b.plot(sh["date"], sh["swing_score"], label="波段（買入評分）", color="orange", linewidth=2)
+                        if _bt_use_sell and "swing_score_sell" in sh.columns:
+                            ax1b.plot(sh["date"], sh["swing_score_sell"], label="波段（賣出評分）", color="#D2691E", linewidth=1.5, linestyle="--", alpha=0.8)
+                        ax1b.axhline(y=bt_buy, color="green", linestyle="--", alpha=0.5, label=f"買入門檻({bt_buy})")
+                        ax1b.axhline(y=bt_sell, color="red", linestyle="--", alpha=0.5, label=f"賣出門檻({bt_sell})")
+                        ax1b.set_ylabel("分數"); ax1b.set_ylim(0, 100)
+                        ax1b.legend(loc="best"); ax1b.grid(True, alpha=0.3)
+                        ax1b.set_title(f"{stock_id} {stock_name}（{strategy_label}） - 🟠 波段評分走勢")
+                        plt.tight_layout(); st.pyplot(fig_bt1b); plt.close()
+                        
+                        st.markdown("---")
+                        
+                        # 圖3: 價值 + 定存（同一張，但只有兩條線）
+                        fig_bt1c, ax1c = plt.subplots(figsize=(12, 3.5))
+                        ax1c.plot(sh["date"], sh["value_score"], label="價值", color="blue", linewidth=2)
+                        ax1c.plot(sh["date"], sh["dividend_score"], label="定存", color="green", linewidth=2)
+                        ax1c.axhline(y=bt_buy, color="green", linestyle="--", alpha=0.5, label=f"買入門檻({bt_buy})")
+                        ax1c.axhline(y=bt_sell, color="red", linestyle="--", alpha=0.5, label=f"賣出門檻({bt_sell})")
+                        ax1c.set_ylabel("分數"); ax1c.set_ylim(0, 100)
+                        ax1c.legend(loc="best"); ax1c.grid(True, alpha=0.3)
+                        ax1c.set_title(f"{stock_id} {stock_name}（{strategy_label}） - 🔵 價值 🟢 定存 評分走勢")
+                        plt.tight_layout(); st.pyplot(fig_bt1c); plt.close()
                     
                     # === C. 價格圖 + 買賣訊號標記 ===
                     st.markdown("**📊 價格走勢與買賣訊號**")
@@ -1231,7 +1520,13 @@ try:
                     plt.close()
                     
                     # === D. 績效摘要表（含已實現/未實現損益 + 雙彈夾） ===
-                    st.markdown("**📋 策略績效總覽**")
+                    mode_tags = []
+                    if _bt_use_sell:
+                        mode_tags.append("賣出策略")
+                    if _bt_dual:
+                        mode_tags.append("雙彈夾")
+                    mode_suffix = f"（{' + '.join(mode_tags)}）" if mode_tags else ""
+                    st.markdown(f"**📋 策略績效總覽{mode_suffix}**")
                     style_names = {"short_term": "短線", "swing": "波段", "value": "價值", "dividend": "定存", "composite": "綜合", "dual_bullet": "🔫 雙彈夾"}
                     perf_cols = st.columns(len(style_names))
                     for i, (sk, scn) in enumerate(style_names.items()):
@@ -1272,23 +1567,30 @@ try:
                     else:
                         st.caption("無交易記錄")
                     
-                    # CSV 下載按鈕（積極/保守各一個）
+                    # CSV 下載按鈕（積極/保守各一個，加上賣出評分版本）
                     st.markdown("---")
                     st.markdown("**💾 回測 CSV 除錯輸出**")
-                    st.caption(f"📁 已儲存至：`data/debug/` 目錄")
-                    col_dl1, col_dl2 = st.columns(2)
+                    st.caption(f"📁 已儲存至：`data/debug/` 目錄 | 💡 啟用賣出評分時，額外產生賣出評分版本 CSV")
+                    col_dl1, col_dl2, col_dl3, col_dl4 = st.columns(4)
+                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
                     with col_dl1:
-                        path_a = st.session_state.get("_bt_csv_path_a", "")
-                        fn_a = st.session_state.get("_bt_csv_name_a", "backtest_active.csv")
                         if st.session_state.get("bt_active") is not None:
-                            csv_data_a = st.session_state["bt_active"].signal_history.to_csv(index=False, encoding='utf-8-sig')
-                            st.download_button(label="📥 下載 積極(60/40) CSV", data=csv_data_a, file_name=fn_a, mime="text/csv")
-                        with col_dl2:
-                            path_c = st.session_state.get("_bt_csv_path_c", "")
-                            fn_c = st.session_state.get("_bt_csv_name_c", "backtest_conservative.csv")
-                            if st.session_state.get("bt_conservative") is not None:
-                                csv_data_c = st.session_state["bt_conservative"].signal_history.to_csv(index=False, encoding='utf-8-sig')
-                                st.download_button(label="📥 下載 保守(70/50) CSV", data=csv_data_c, file_name=fn_c, mime="text/csv")
+                            csv_a = st.session_state["bt_active"].signal_history.to_csv(index=False, encoding='utf-8-sig')
+                            st.download_button("📥 積極 60/40", data=csv_a, file_name=f"backtest_{stock_id}_{ts}_60_40.csv", mime="text/csv")
+                    with col_dl2:
+                        if st.session_state.get("bt_conservative") is not None:
+                            csv_c = st.session_state["bt_conservative"].signal_history.to_csv(index=False, encoding='utf-8-sig')
+                            st.download_button("📥 保守 70/50", data=csv_c, file_name=f"backtest_{stock_id}_{ts}_70_50.csv", mime="text/csv")
+                    with col_dl3:
+                        bt_as = st.session_state.get("bt_active_sell")
+                        if bt_as is not None and bt_as.signal_history is not None and not bt_as.signal_history.empty:
+                            csv_as = bt_as.signal_history.to_csv(index=False, encoding='utf-8-sig')
+                            st.download_button("📥 積極+賣出評分", data=csv_as, file_name=f"backtest_{stock_id}_{ts}_60_40_sell.csv", mime="text/csv")
+                    with col_dl4:
+                        bt_cs = st.session_state.get("bt_conservative_sell")
+                        if bt_cs is not None and bt_cs.signal_history is not None and not bt_cs.signal_history.empty:
+                            csv_cs = bt_cs.signal_history.to_csv(index=False, encoding='utf-8-sig')
+                            st.download_button("📥 保守+賣出評分", data=csv_cs, file_name=f"backtest_{stock_id}_{ts}_70_50_sell.csv", mime="text/csv")
                     
                     # 雙彈夾 CSV 下載（如果該策略有雙彈夾資料）
                     _bt_db_a = st.session_state.get("bt_active", None)
@@ -1403,12 +1705,36 @@ try:
                             st.markdown(f"**📝 一句話總結**")
                             st.info(ba["summary"])
                         
-                        # 2. 交易點位深度解說（故事性敘述，含進出點位時空背景）
+                        # 2. 各風格績效分析（short_term / swing / value / dividend / composite）
+                        style_analysis = ba.get("style_analysis", {})
+                        if style_analysis:
+                            st.markdown("---")
+                            st.markdown("**📊 各風格績效分析**")
+                            style_labels = {
+                                "short_term": ("🔴 短線", "#E74C3C"),
+                                "swing": ("🟠 波段", "#E67E22"),
+                                "value": ("🔵 價值", "#2980B9"),
+                                "dividend": ("🟢 定存", "#27AE60"),
+                                "composite": ("⚪ 綜合", "#7F8C8D"),
+                            }
+                            for sk, (label, color) in style_labels.items():
+                                sa = style_analysis.get(sk, {})
+                                if sa:
+                                    perf = sa.get("performance", "")
+                                    comment = sa.get("comment", "")
+                                    st.markdown(f"**{label}**")
+                                    st.caption(f"📈 {perf}" if perf else "")
+                                    if comment:
+                                        st.markdown(comment)
+                                    st.markdown("---")
+                        
+                        # 3. 交易點位深度解說（故事性敘述，含進出點位時空背景）
                         if ba.get("narrative"):
                             st.markdown("**📖 交易點位深度解說**")
                             st.markdown(ba["narrative"])
+                            st.markdown("---")
                         
-                        # 3. 整體策略核心診斷
+                        # 4. 整體策略核心診斷
                         if ba.get("diagnosis"):
                             st.markdown("**🔍 整體策略核心診斷**")
                             st.warning(ba["diagnosis"])
@@ -1578,51 +1904,199 @@ try:
             "dividend": ("定存", "🟢"),
         }
         
-        cols = st.columns(4)
-        for i, (key, (label, icon)) in enumerate(score_labels.items()):
-            with cols[i]:
-                score_data = scores.get(key, {})
-                total = score_data.get("total", 0)
-                breakdown = score_data.get("breakdown", {})
-                
-                if total >= 70:
-                    delta = "⬆️ 佳"
-                elif total >= 50:
-                    delta = "➡️ 普通"
-                else:
-                    delta = "⬇️ 待加強"
-                
-                st.metric(f"{icon} {label}", f"{total}/100", delta)
-                
+        # 四維度雷達圖配置
+        DIMENSION_CONFIG = {
+            "short_term": {
+                "title": "🔴 短線",
+                "color": "#E74C3C",
+                "labels": ["趨勢結構", "動能強度", "成交量", "法人籌碼", "籌碼健康", "波動風險"],
+                "weights": [20, 20, 20, 15, 15, 10],
+                "sub_keys": ["trend_structure", "momentum", "volume", "institutional", "chip", "risk"],
+            },
+            "swing": {
+                "title": "🟠 波段",
+                "color": "#E67E22",
+                "labels": ["營收動能", "中期趨勢", "籌碼趨勢", "獲利成長", "估值位置", "催化因子"],
+                "weights": [25, 20, 20, 15, 10, 10],
+                "sub_keys": ["revenue_momentum", "mid_trend", "institutional_trend", "earnings_growth", "valuation", "catalyst"],
+            },
+            "value": {
+                "title": "🔵 價值",
+                "color": "#2980B9",
+                "labels": ["估值安全", "獲利品質", "成長能力", "財務安全", "現金流品質", "股東報酬"],
+                "weights": [15, 20, 30, 15, 10, 10],
+                "sub_keys": ["valuation_safety", "profit_quality", "growth_ability", "financial_safety", "cash_flow_quality", "shareholder_return"],
+            },
+            "dividend": {
+                "title": "🟢 定存",
+                "color": "#27AE60",
+                "labels": ["配息紀錄", "配息品質", "現金流", "財務安全", "獲利穩定", "長期成長"],
+                "weights": [25, 20, 20, 15, 10, 10],
+                "sub_keys": ["dividend_record", "dividend_quality", "cash_flow", "financial_safety", "profit_stability", "long_term_growth"],
+            },
+        }
+        
+        # 第一排雷達圖：短線買 + 短線賣 + 波段買 + 波段賣（4 欄）
+        st.markdown("**📊 四維度評分六邊形雷達圖**")
+        st.caption("短線/波段顯示買入/賣出雙軌評分，價值/定存顯示單一總分")
+        
+        # 提取分數
+        st_data = {k: scores.get(k, {}) for k in ["short_term", "swing", "value", "dividend"]}
+        st_buy = {k: v.get("total_buy", v.get("total", 0)) for k, v in st_data.items()}
+        st_sell = {k: v.get("total_sell", st_buy[k]) for k, v in st_data.items()}
+        
+        # 第一排：短線買、短線賣、波段買、波段賣（4 個雷達圖）
+        radar_row1 = st.columns(4)
+        dual_keys = [
+            ("short_term", "買", "🟢"),
+            ("short_term", "賣", "🔴"),
+            ("swing", "買", "🟢"),
+            ("swing", "賣", "🔴"),
+        ]
+        cfg_map = {
+            "short_term": ("🔴 短線", "#E74C3C", ["趨勢結構", "動能強度", "成交量", "法人籌碼", "籌碼健康", "波動風險"], [20,20,20,15,15,10], ["trend_structure", "momentum", "volume", "institutional", "chip", "risk"]),
+            "swing": ("🟠 波段", "#E67E22", ["營收動能", "中期趨勢", "籌碼趨勢", "獲利成長", "估值位置", "催化因子"], [25,20,20,15,10,10], ["revenue_momentum", "mid_trend", "institutional_trend", "earnings_growth", "valuation", "catalyst"]),
+        }
+        for idx, (dk, mode, mode_icon) in enumerate(dual_keys):
+            with radar_row1[idx]:
+                base_title, color, labels, weights, sub_keys = cfg_map[dk]
+                sd = st_data[dk]
+                bd = sd.get("breakdown", {})
+                vals = [bd.get(sk, 0) for sk in sub_keys]
+                score = st_buy[dk] if mode == "買" else st_sell[dk]
+                full_title = f"{base_title} {mode_icon}{mode} {score}"
+                fig = _radar_chart(labels, vals, full_title, color, weights)
+                st.pyplot(fig, use_container_width=True)
+                plt.close()
+                # 短線/波段雷達圖下方也加上「查看細項」
                 breakdown_labels = {
+                    # 短線（short_term）
                     "trend_structure": ("趨勢結構", 20),
                     "momentum": ("動能強度", 20),
                     "volume": ("成交量結構", 20),
                     "institutional": ("法人籌碼", 15),
                     "chip": ("籌碼健康", 15),
                     "risk": ("波動風險", 10),
+                    # 波段（swing）
                     "revenue_momentum": ("營收動能", 25),
                     "mid_trend": ("中期趨勢", 20),
                     "institutional_trend": ("籌碼趨勢", 20),
                     "earnings_growth": ("獲利成長", 15),
                     "valuation": ("估值位置", 10),
                     "catalyst": ("催化因子", 10),
-                    "valuation_safety": ("估值安全", 25),
+                }
+                with st.expander("查看細項"):
+                    st.markdown("**各子項評分明細**")
+                    details = sd.get("details", {})
+                    for sub_key, sub_val in bd.items():
+                        info = breakdown_labels.get(sub_key)
+                        if info:
+                            cn_name, weight = info
+                            pct = sub_val / 100.0
+                            if sub_val >= 80:
+                                emoji = "🟢"
+                            elif sub_val >= 60:
+                                emoji = "🟡"
+                            elif sub_val >= 30:
+                                emoji = "🟠"
+                            else:
+                                emoji = "🔴"
+                            st.markdown(f"{emoji} **{cn_name}**（權重 {weight}%）: **{sub_val}/100**")
+                            st.progress(pct)
+                            
+                            sub_details = details.get(sub_key, {})
+                            if sub_details:
+                                raw_items = []
+                                score_items = []
+                                for dk2, dv in sub_details.items():
+                                    if dv is not None and not (isinstance(dv, float) and pd.isna(dv)):
+                                        dk_cn = cn(dk2)
+                                        if isinstance(dv, float):
+                                            text = f"{dk_cn}: {dv:.2f}"
+                                        else:
+                                            text = f"{dk_cn}: {dv}"
+                                        if "_score" in dk2:
+                                            score_items.append(text)
+                                        else:
+                                            raw_items.append(text)
+                                if raw_items:
+                                    st.caption("📊 原始數據：")
+                                    for item in raw_items:
+                                        st.caption(item)
+                                if score_items:
+                                    st.caption("📋 評分結果：")
+                                    for item in score_items:
+                                        st.caption(item)
+                        else:
+                            st.caption(f"⚪ {sub_key}: {sub_val}/100")
+                    
+                    modifiers = sd.get("modifiers", {})
+                    if modifiers:
+                        st.markdown("---")
+                        st.markdown("**⚙️ 調整因子**")
+                        for mod_key, mod_val in modifiers.items():
+                            if isinstance(mod_val, dict):
+                                mod_parts = [f"{mk}: {mv}" for mk, mv in mod_val.items()]
+                                st.caption(f"  {mod_key}: {', '.join(mod_parts)}")
+                            else:
+                                st.caption(f"  {mod_key}: {mod_val}")
+        
+        st.markdown("---")
+        
+        # 第二排：價值 + 定存（2 欄），附"查看細項"
+        radar_row2 = st.columns(2)
+        single_keys = ["value", "dividend"]
+        single_cfg = {
+            "value": ("🔵 價值", "#2980B9", ["估值安全", "獲利品質", "成長能力", "財務安全", "現金流品質", "股東報酬"], [15,20,30,15,10,10], ["valuation_safety", "profit_quality", "growth_ability", "financial_safety", "cash_flow_quality", "shareholder_return"]),
+            "dividend": ("🟢 定存", "#27AE60", ["配息紀錄", "配息品質", "現金流", "財務安全", "獲利穩定", "長期成長"], [25,20,20,15,10,10], ["dividend_record", "dividend_quality", "cash_flow", "financial_safety", "profit_stability", "long_term_growth"]),
+        }
+        for idx, sk in enumerate(single_keys):
+            with radar_row2[idx]:
+                base_title, color, labels, weights, sub_keys = single_cfg[sk]
+                sd = st_data[sk]
+                bd = sd.get("breakdown", {})
+                vals = [bd.get(sk, 0) for sk in sub_keys]
+                total = st_buy[sk]
+                full_title = f"{base_title} {total}"
+                fig = _radar_chart(labels, vals, full_title, color, weights)
+                st.pyplot(fig, use_container_width=True)
+                plt.close()
+                st.metric(f"{base_title}", f"{total}/100")
+                # 雷達圖下方直接接「查看細項」
+                breakdown_labels = {
+                    # 短線（short_term）
+                    "trend_structure": ("趨勢結構", 20),
+                    "momentum": ("動能強度", 20),
+                    "volume": ("成交量結構", 20),
+                    "institutional": ("法人籌碼", 15),
+                    "chip": ("籌碼健康", 15),
+                    "risk": ("波動風險", 10),
+                    # 波段（swing）
+                    "revenue_momentum": ("營收動能", 25),
+                    "mid_trend": ("中期趨勢", 20),
+                    "institutional_trend": ("籌碼趨勢", 20),
+                    "earnings_growth": ("獲利成長", 15),
+                    "valuation": ("估值位置", 10),
+                    "catalyst": ("催化因子", 10),
+                    # 價值（value）
+                    "valuation_safety": ("估值安全", 15),
                     "profit_quality": ("獲利品質", 20),
-                    "growth_ability": ("成長能力", 20),
+                    "growth_ability": ("成長能力", 30),
                     "financial_safety": ("財務安全", 15),
                     "cash_flow_quality": ("現金流品質", 10),
                     "shareholder_return": ("股東報酬", 10),
+                    # 定存（dividend）
                     "dividend_record": ("配息紀錄", 25),
                     "dividend_quality": ("配息品質", 20),
                     "cash_flow": ("現金流", 20),
+                    "financial_safety": ("財務安全", 15),
                     "profit_stability": ("獲利穩定", 10),
                     "long_term_growth": ("長期成長", 10),
                 }
                 with st.expander("查看細項"):
                     st.markdown("**各子項評分明細**")
-                    details = score_data.get("details", {})
-                    for sub_key, sub_val in breakdown.items():
+                    details = sd.get("details", {})
+                    for sub_key, sub_val in bd.items():
                         info = breakdown_labels.get(sub_key)
                         if info:
                             cn_name, weight = info
@@ -1664,7 +2138,7 @@ try:
                         else:
                             st.caption(f"⚪ {sub_key}: {sub_val}/100")
                     
-                    modifiers = score_data.get("modifiers", {})
+                    modifiers = sd.get("modifiers", {})
                     if modifiers:
                         st.markdown("---")
                         st.markdown("**⚙️ 調整因子**")
@@ -1970,11 +2444,14 @@ try:
                 st.markdown("**💾 匯出 Debug CSV**")
                 st.caption("選擇欄位後，點擊按鈕手動匯出母表 CSV 到 bug/ 目錄")
                 
-                # 選擇要匯出的欄位群組
+                # 選擇要匯出的欄位群組（顯示中文 + 英文對照）
+                _export_options = list(base.columns)
+                _export_labels = {col: f"{col}  ({cn(col)})" for col in _export_options}
                 export_cols = st.multiselect(
-                    "選擇要匯出的欄位（預設全部）",
-                    options=list(base.columns),
-                    default=list(base.columns),
+                    "選擇要匯出的欄位(預設全部)",
+                    options=_export_options,
+                    default=_export_options,
+                    format_func=lambda x: _export_labels.get(x, x),
                     key="export_cols"
                 )
                 
@@ -1993,6 +2470,7 @@ try:
                     with open(filepath, "w", encoding="utf-8-sig") as f:
                         f.write(csv_data)
                     
+    
                     st.success(f"✅ 已儲存至：`{filepath}`")
                     st.caption(f"📊 {len(export_df_selected)} 行 x {len(export_df_selected.columns)} 欄")
                 else:
@@ -2022,7 +2500,7 @@ try:
                 ret = sd.get("total_return_pct", 0.0)
                 if ret > best_return:
                     best_return = ret
-                    best_style = scn
+            best_style = scn
             
             # 五欄 KPI
             bt_cols = st.columns(5)

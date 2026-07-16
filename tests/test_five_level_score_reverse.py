@@ -69,14 +69,14 @@ def test_reverse_with_poor():
 
 
 def test_reverse_weak_case():
-    """pe_percentile=70 應得 30 分（weak）"""
+    """pe_percentile=70 應得 50 分（weak，v2.0 平滑映射）"""
     result = five_level_score(70, {
         "_excellent": 20,
         "_good": 40,
         "_normal": 60,
         "_weak": 80,
     }, reverse=True)
-    assert result == 30, f"[FAIL] pe_percentile=70 should be 30, got {result}"
+    assert result == 50, f"[FAIL] pe_percentile=70 should be 50, got {result}"
     print(f"[PASS] pe_percentile=70 -> {result}")
 
 

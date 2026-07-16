@@ -298,7 +298,8 @@ def build_user_message(
             else:
                 msg += f"  └ {ib.get('reason','產業負債正常')}\n"
         
-        msg += "\n"
+        # 維度間分隔線
+        msg += "  ───────────────\n\n"
     
     # Advisor 建議
     msg += "【系統建議】\n"

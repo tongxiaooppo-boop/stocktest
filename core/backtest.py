@@ -80,6 +80,7 @@ def run_backtest(
     dual_bullet: bool = False,
     dual_bullet_mode: str = "dip",
     dual_bullet_drop_pct: float = -8.0,
+    use_sell_score: bool = False,
 ) -> BacktestResult:
     """
     執行完整回測
@@ -96,6 +97,7 @@ def run_backtest(
         dual_bullet: 是否啟用雙彈夾分批建倉
         dual_bullet_mode: 加碼模式（dip=下跌加碼, breakout=順勢突破）
         dual_bullet_drop_pct: 下跌加碼門檻（預設 -8%）
+        use_sell_score: 若 True，短線/波段賣出使用獨立賣出評分（total_sell）
     
     Returns:
         BacktestResult: 完整回測結果
@@ -136,9 +138,11 @@ def run_backtest(
         hist_df["date"] = pd.to_datetime(hist_df["date"])
     hist_df = hist_df.sort_values("date").reset_index(drop=True)
     
-    # 合併價格資料
-    if "close" in df.columns and "date" in df.columns:
-        price_df = df[["date", "close"]].copy()
+    # 合併價格資料（優先使用 adj_close 避免分割/減資造成的價格斷層）
+    price_col = "adj_close" if "adj_close" in df.columns else "close"
+    if price_col in df.columns and "date" in df.columns:
+        price_df = df[["date", price_col]].copy()
+        price_df = price_df.rename(columns={price_col: "close"})  # 統一命名為 close，讓 _parse_trades 等函式相容
         price_df["date"] = pd.to_datetime(price_df["date"])
         price_df = price_df.sort_values("date").drop_duplicates(subset=["date"])
         hist_df = pd.merge_asof(
@@ -172,19 +176,31 @@ def run_backtest(
     # 四種風格獨立策略
     for style in style_keys:
         score_col = style_scores[style]
+        # 若啟用賣出評分雙軌制，短線/波段使用獨立賣出分數欄位
+        sell_score_col = None
+        if use_sell_score and style in ("short_term", "swing"):
+            sell_score_col = f"{style}_score_sell"
         trades = _parse_trades(
             hist_df, score_col, style,
             buy_threshold, sell_threshold,
+            sell_score_col=sell_score_col,
         )
         result.styles[style]["trades"] = trades
         result.styles[style]["trade_count"] = len(trades)
         result.styles[style]["total_return_pct"] = _calc_total_return(trades)
         result.styles[style]["win_rate"] = _calc_win_rate(trades)
     
-    # 綜合策略
+    # 綜合策略（若啟用賣出評分，短線/波段賣出使用獨立賣出分數）
+    composite_sell_scores = None
+    if use_sell_score:
+        composite_sell_scores = {
+            "short_term": "short_term_score_sell",
+            "swing": "swing_score_sell",
+        }
     composite_trades = _parse_composite_trades(
         hist_df, style_scores,
         buy_threshold, sell_threshold,
+        sell_style_scores=composite_sell_scores,
     )
     result.styles["composite"]["trades"] = composite_trades
     result.styles["composite"]["trade_count"] = len(composite_trades)
@@ -224,7 +240,7 @@ def run_backtest(
     for i, row in hist_df.iterrows():
         record = {
             "date": row["date"],
-            "price": row.get("close", np.nan),
+            "price": row.get("adj_close", row.get("close", np.nan)),
         }
         # 對齊技術指標
         if not df_tech.empty:
@@ -251,8 +267,8 @@ def run_backtest(
         record["high"] = day_high
         record["low"] = day_low
         
-        # 計算雙軌建議價（使用 trade_manager 的折扣法）
-        close_price = row.get("close", np.nan)
+        # 計算雙軌建議價（使用 adj_close 避免分割/減資造成的價格斷層）
+        close_price = row.get("adj_close", row.get("close", np.nan))
         ma_20_val = record.get("MA_20", np.nan)
         ma_5_val = record.get("MA_5", np.nan)
         pe_pct_val = record.get("PE_Percentile", np.nan)
@@ -293,6 +309,9 @@ def run_backtest(
         for style in style_keys:
             score_col = style_scores[style]
             record[score_col] = row.get(score_col, np.nan)
+            # 產出賣出評分欄位（供分數走勢圖顯示賣出線）
+            sell_col = f"{style}_score_sell"
+            record[sell_col] = row.get(sell_col, np.nan)
             
             trades_for_style = result.styles[style]["trades"]
             buy_signal = False
@@ -436,12 +455,16 @@ def _parse_trades(
     style_name: str,
     buy_threshold: int = 70,
     sell_threshold: int = 50,
+    sell_score_col: str = None,
 ) -> List[TradeRecord]:
     """
     解析單一風格的買賣訊號
     
     買入：分數首次 ≥ buy_threshold
     賣出：分數跌破 sell_threshold
+    
+    Parameters:
+        sell_score_col: 若指定，則賣出時使用該分數欄位（雙軌制）
     """
     trades = []
     holding = False
@@ -459,7 +482,16 @@ def _parse_trades(
                 entry_price = row.get("close", np.nan)
                 entry_date = row["date"]
         else:
-            if score < sell_threshold:
+            # 賣出判斷：若指定 sell_score_col 則使用賣出評分，否則沿用買入評分
+            if sell_score_col is not None:
+                sell_score = row.get(sell_score_col, 0)
+                if pd.isna(sell_score):
+                    sell_score = 0
+                should_sell = sell_score < sell_threshold
+            else:
+                should_sell = score < sell_threshold
+            
+            if should_sell:
                 holding = False
                 exit_price = row.get("close", np.nan)
                 if pd.notna(entry_price) and pd.notna(exit_price) and entry_price > 0:
@@ -501,6 +533,7 @@ def _parse_composite_trades(
     style_scores: dict,
     buy_threshold: int = 70,
     sell_threshold: int = 50,
+    sell_style_scores: dict = None,
 ) -> List[TradeRecord]:
     """
     解析綜合策略的買賣訊號
@@ -508,6 +541,11 @@ def _parse_composite_trades(
     買入：≥2 種風格分數 ≥ buy_threshold
     賣出：≥2 種風格分數 < sell_threshold
     成本：加權平均
+    
+    Parameters:
+        sell_style_scores: 若指定，賣出時使用該分數欄位（雙軌制）
+                          例如 {"short_term": "short_term_score_sell", "swing": "swing_score_sell"}
+                          未指定的風格仍沿用買入評分
     """
     trades = []
     holding = False
@@ -517,13 +555,14 @@ def _parse_composite_trades(
     style_keys = list(style_scores.keys())
     
     for i, row in hist_df.iterrows():
-        scores = {}
+        # 買入：永遠使用買入評分
+        buy_scores = {}
         for style in style_keys:
             score = row.get(style_scores[style], 0)
-            scores[style] = 0 if pd.isna(score) else score
+            buy_scores[style] = 0 if pd.isna(score) else score
         
         if not holding:
-            buy_count = sum(1 for s in scores.values() if s >= buy_threshold)
+            buy_count = sum(1 for s in buy_scores.values() if s >= buy_threshold)
             if buy_count >= 2:
                 holding = True
                 entry_price = row.get("close", np.nan)
@@ -531,7 +570,16 @@ def _parse_composite_trades(
                 total_shares = 1.0
                 total_cost = entry_price * total_shares
         else:
-            sell_count = sum(1 for s in scores.values() if s < sell_threshold)
+            # 賣出：若有指定賣出評分欄位則使用之
+            sell_scores = {}
+            for style in style_keys:
+                if sell_style_scores is not None and style in sell_style_scores:
+                    sc = row.get(sell_style_scores[style], 0)
+                    sell_scores[style] = 0 if pd.isna(sc) else sc
+                else:
+                    sc = row.get(style_scores[style], 0)
+                    sell_scores[style] = 0 if pd.isna(sc) else sc
+            sell_count = sum(1 for s in sell_scores.values() if s < sell_threshold)
             if sell_count >= 2:
                 holding = False
                 exit_price = row.get("close", np.nan)
