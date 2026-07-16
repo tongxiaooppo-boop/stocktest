@@ -62,6 +62,16 @@ if %errorlevel% neq 0 (
 echo   ✅ Commit 完成
 echo.
 
+echo [3/4] 先 Pull 遠端變更（避免 reject）...
+git pull --rebase
+if %errorlevel% neq 0 (
+    echo   ⚠️  Pull 失敗，可能存在衝突
+    echo   請手動解決衝突後再執行 git push
+    goto :SKIP_PUSH
+)
+echo   ✅ Pull 完成
+echo.
+
 echo [3/4] Push 至 GitHub 遠端倉庫...
 git push
 if %errorlevel% neq 0 (
