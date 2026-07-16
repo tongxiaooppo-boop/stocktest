@@ -1678,6 +1678,14 @@ try:
                         else:
                             _bt_ai_target = st.session_state.get("bt_active")
                             _bt_ai_label = "積極 (60/40)"
+                        # 附加策略型態標籤
+                        _mode_tags = []
+                        if _bt_use_sell:
+                            _mode_tags.append("賣出評分雙軌")
+                        if _bt_dual:
+                            _mode_tags.append("雙彈夾")
+                        if _mode_tags:
+                            _bt_ai_label += f"（{' + '.join(_mode_tags)}）"
                         
                         if _bt_ai_target is None:
                             st.warning("⚠️ 請先執行回測（點擊「▶️ 執行回測（雙策略）」）")
