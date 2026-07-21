@@ -1,5 +1,5 @@
 """
-台股AI個人化決策系統 v2.0
+台股AI個人化決策系統 v2.1
 Streamlit 前端主入口 — 串接真實資料 + 圖表
 
 瀑布流顯示順序：
@@ -88,6 +88,9 @@ FIELD_CN_MAP = {
     "Above_MA_60": "站上60日線",
     "Bullish_MA": "多頭排列",
     "Volume_Above_MA5": "量站上5日均量",
+    "Low_10D": "10日最低價",
+    "Consec_Up_Days": "連續上漲天數",
+    "Consec_Down_Days": "連續下跌天數",
     # 籌碼面
     "Foreign_Net": "外資買賣超",
     "Trust_Net": "投信買賣超",
@@ -108,6 +111,8 @@ FIELD_CN_MAP = {
     "Revenue_MoM": "營收月增率",
     "Revenue_Accelerating": "營收加速",
     "Revenue_Momentum": "營收動能",
+    "Revenue_12M_High": "營收創12月新高",
+    "Revenue_6M_High": "營收創6月新高",
     "Price_Revenue_Divergence": "價量背離",
     "TTM_EPS": "近四季EPS",
     "TTM_EPS_Valid": "EPS有效性",
@@ -309,13 +314,13 @@ def _radar_chart(labels: list, values: list, title: str, color: str,
 
 
 st.set_page_config(
-    page_title="台股AI個人化決策系統 v2.0",
+    page_title="台股AI個人化決策系統 v2.1",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("📈 台股AI個人化決策系統 v2.0 🕐 盤後版")
+st.title("📈 台股AI個人化決策系統 v2.1 🕐 盤後版")
 st.caption("⚠️ 免責聲明：本系統僅供個人分析參考，不構成任何投資建議或推薦。使用者應自行審慎評估，投資有盈虧風險，請自負責任。")
 st.caption("📌 **資料更新時間說明（依 FinMind 更新時程，非即時報價）**：")
 st.caption("   📊 **股價收盤價** — 盤後約 **14:30~15:30** 更新（當日收盤）")
@@ -375,7 +380,19 @@ with st.sidebar:
     shares = st.number_input("股數", min_value=0, step=100, value=0)
     
     st.markdown("---")
-    
+
+    # === v3.0 短線分析師人格選擇 ===
+    analyst_profile = st.radio(
+        "🧠 短線分析師",
+        options=["激進型", "穩重型"],
+        format_func=lambda x: f"🔥 {x}" if x == "激進型" else f"🛡️ {x}",
+        horizontal=True,
+        help="激進型：重動能/慣性突破，適合強勢股追價\n穩重型：重趨勢/法人籌碼，適合盤整或保守進場",
+        key="analyst_profile",
+    )
+    _profile_map = {"激進型": "chaser", "穩重型": "stable"}
+    selected_profile = _profile_map[analyst_profile]
+
     analyze_btn = st.button("🔍 開始分析", type="primary", use_container_width=True)
     
     st.markdown("---")
@@ -420,7 +437,7 @@ if _doc_to_show:
         st.session_state["_doc_to_show"] = None
 
 # ===== 追蹤按鈕點擊事件 =====
-cache_key = f"cache_{stock_id}"
+cache_key = f"cache_{stock_id}_{selected_profile}"
 
 if backtest_btn:
     if cache_key in st.session_state:
@@ -432,9 +449,17 @@ if backtest_btn:
 
 # 強制刷新：清除 session_state + SQLite + Parquet 快取
 if refresh_cache_btn:
-    # 清除 session 快取
+    # 清除 session 快取（含 raw + score 兩層）
+    raw_cache_key = f"raw_{stock_id}"
+    if raw_cache_key in st.session_state:
+        del st.session_state[raw_cache_key]
     if cache_key in st.session_state:
         del st.session_state[cache_key]
+    # 也清除另一個 profile 的 score cache
+    _other_profile = "chaser" if selected_profile == "stable" else "stable"
+    _other_cache_key = f"cache_{stock_id}_{_other_profile}"
+    if _other_cache_key in st.session_state:
+        del st.session_state[_other_cache_key]
     st.session_state["analyzed"] = False
     # 清除 SQLite 快取
     try:
@@ -508,99 +533,199 @@ waterfall_5 = st.empty()  # 風險提示 + 除錯面板
 waterfall_6 = st.empty()  # 回測結果摘要（若有執行過）
 
 try:
-    # ===== 檢查快取：優先 session_state，其次 SQLite (analysis_cache) =====
-    cache_key = f"cache_{stock_id}"
+    # ===== 兩層快取設計 =====
+    # raw_cache: FinMind 原始資料 + 指標計算（跨分析師共用，key 為 stock_id）
+    # score_cache: 評分 + 建議 + AI（分析師各自獨立，key 為 stock_id + profile）
+    cache_key = f"cache_{stock_id}_{selected_profile}"
+    raw_cache_key = f"raw_{stock_id}"
+    _has_raw_cache = raw_cache_key in st.session_state
     _has_cache = cache_key in st.session_state
     
-    # 如果 session_state 沒有快取，嘗試從 SQLite + Parquet 載入
-    if not _has_cache:
+    # 如果 session_state 沒有任何快取，嘗試從磁碟載入
+    if not _has_raw_cache and not _has_cache:
         try:
             from news.database import load_analysis_cache
-            sql_cache = load_analysis_cache(stock_id)
-            # Parquet 快取路徑
             cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cache")
             parquet_path = os.path.join(cache_dir, f"{stock_id}_base.parquet")
             
-            if sql_cache is not None and os.path.exists(parquet_path):
-                # 檢查快取日期：同一天有效，跨天強制重跑（FinMind 資料可能已更新）
-                cache_date = sql_cache.get("cache_date", "")
-                today = datetime.now().strftime("%Y-%m-%d")
-                cache_is_today = cache_date and cache_date.startswith(today)
+            if os.path.exists(parquet_path):
+                base = pd.read_parquet(parquet_path)
+                # 載入 raw cache（FinMind 資料已在 Parquet 中）
+                raw_date = None
+                # 嘗試從任一 profile 的 SQLite 載入 raw 資訊（fetch_info, stock_name 等跨分析師共用）
+                for _profile_try in [selected_profile, "chaser", "stable"]:
+                    sql_cache = load_analysis_cache(stock_id, profile=_profile_try)
+                    if sql_cache is not None:
+                        cache_date = sql_cache.get("cache_date", "")
+                        today = datetime.now().strftime("%Y-%m-%d")
+                        if cache_date and cache_date.startswith(today):
+                            raw_date = cache_date
+                            st.session_state[raw_cache_key] = {
+                                "base": base,
+                                "fetch_info": sql_cache.get("fetch_info", {}),
+                                "stock_name": sql_cache.get("stock_name", stock_id),
+                                "df_taiex": None,  # 不需要儲存大盤（僅顯示用）
+                            }
+                            _has_raw_cache = True
+                            break
                 
-                if cache_is_today:
-                    base = pd.read_parquet(parquet_path)
-                    sql_cache["base"] = base
-                    st.session_state[cache_key] = sql_cache
-                    _has_cache = True
-                else:
-                    # 過期快取，清除後讓系統重新分析
-                    from news.database import delete_analysis_cache
-                    delete_analysis_cache(stock_id)
+                if not _has_raw_cache:
+                    # 快取過期，清除 Parquet
                     if os.path.exists(parquet_path):
                         os.remove(parquet_path)
-                    # 不顯示提示訊息，靜默重新分析
         except Exception:
             pass
     
+    # 如果有 raw cache 但沒有 profile-specific score cache，嘗試從 SQLite 載入 scores
+    if _has_raw_cache and not _has_cache:
+        try:
+            from news.database import load_analysis_cache
+            sql_cache = load_analysis_cache(stock_id, profile=selected_profile)
+            if sql_cache is not None:
+                cache_date = sql_cache.get("cache_date", "")
+                today = datetime.now().strftime("%Y-%m-%d")
+                if cache_date and cache_date.startswith(today):
+                    st.session_state[cache_key] = {
+                        "scores": sql_cache["scores"],
+                        "advice": sql_cache.get("advice", {}),
+                        "trade_advice": sql_cache.get("trade_advice"),
+                        "ai_result": sql_cache.get("ai_result"),
+                    }
+                    _has_cache = True
+        except Exception:
+            pass
+    
+    # 如果有 profile score cache，從中提取
     if _has_cache:
-        cache = st.session_state[cache_key]
+        score_cache = st.session_state[cache_key]
+        scores = score_cache["scores"]
+        advice = score_cache.get("advice", {})
+        trade_advice = score_cache.get("trade_advice")
+        ai_result = score_cache.get("ai_result")
+        stock_name = st.session_state[raw_cache_key]["stock_name"] if _has_raw_cache else stock_id
+        fetch_info = st.session_state[raw_cache_key].get("fetch_info", {}) if _has_raw_cache else {}
+        base = st.session_state[raw_cache_key]["base"] if _has_raw_cache else None
         
-        # 檢查快取中的 trade_advice 是否為舊版（缺 v4.4 雙軌欄位）
-        # 注意：TradeAdvice 是 dataclass，hasattr 對 agg_entry 永遠 True（有預設值）
-        # 改用檢查 agg_entry 是否為 None 來判斷是否真正有雙軌資料
-        old_ta = cache.get("trade_advice", None)
-        if old_ta is not None:
+        # 檢查 trade_advice 是否為舊版
+        if trade_advice is not None and base is not None:
             is_old_version = (
-                old_ta.agg_entry is None
-                and old_ta.cons_entry is None
-                and old_ta.action in ("買進",)
-                and "建議價位區間對照" not in (old_ta.message or "")
+                trade_advice.agg_entry is None
+                and trade_advice.cons_entry is None
+                and trade_advice.action in ("買進",)
+                and "建議價位區間對照" not in (trade_advice.message or "")
             )
             if is_old_version:
-                # 舊版快取，清除後強制重新分析
                 del st.session_state[cache_key]
-                st.session_state["analyzed"] = False
-                st.info("🔄 偵測到舊版快取，正在重新分析以啟用雙軌建議價功能...")
-                _has_cache = False  # 讓程式碼落入下方的 else 重新分析
+                _has_cache = False
         
-        if _has_cache:
-            base = cache["base"]
-            fetch_info = cache["fetch_info"]
-            scores = cache["scores"]
-            advice = cache["advice"]
-            trade_advice = cache.get("trade_advice", None)
-            ai_result = cache.get("ai_result", None)
-            stock_name = cache.get("stock_name", stock_id)
-            df_taiex = cache.get("df_taiex", None)
-            df_info = cache.get("df_info", None)
-            df_rev = cache.get("df_rev", None)
-            df_fin = cache.get("df_fin", None)
-            df_bal = cache.get("df_bal", None)
-            df_cf = cache.get("df_cf", None)
-            df_div = cache.get("df_div", None)
-            df_price = cache.get("df_price", None)
-            df_per = cache.get("df_per", None)
-            df_inst = cache.get("df_inst", None)
-            df_margin = cache.get("df_margin", None)
-            df_ss = cache.get("df_ss", None)
-            
-            # 用最新的個人化持股重新產生 trade_advice（快取中的是舊的）
+        if _has_cache and base is not None:
+            # 圖表需要的原始 DataFrame（已併入 base，設 None 讓圖表 fallback）
+            df_taiex = None
+            df_info = None
+            df_rev = None
+            df_fin = None
+            df_bal = None
+            df_cf = None
+            df_div = None
+            df_per = None
+            df_price = None
+            df_inst = None
+            df_margin = None
+            df_ss = None
+            # 用最新持股重新產生 trade_advice
             try:
                 trade_advice = generate_trade_advice(
-                    stock_id=stock_id,
-                    df=base,
-                    scores=scores,
+                    stock_id=stock_id, df=base, scores=scores,
                     current_shares=shares if has_position else 0,
                     average_cost=avg_price if has_position else 0.0,
                 )
             except Exception:
-                pass  # 沿用快取中的 trade_advice
-            
-            # 跳過撈取，直接顯示
+                pass
             progress_bar.empty()
             status_text.empty()
     
-    if not _has_cache:
+    # 如果有 raw cache 但沒有 profile score cache → 只做 re-scoring，不重拉 FinMind
+    _need_rescore = _has_raw_cache and not _has_cache
+    
+    if _need_rescore:
+        # 切換分析師：base 已快取，只重新評分
+        raw_cache = st.session_state[raw_cache_key]
+        base = raw_cache["base"]
+        stock_name = raw_cache.get("stock_name", stock_id)
+        fetch_info = raw_cache.get("fetch_info", {})
+        # 圖表需要的原始 DataFrame（已併入 base，設 None 讓圖表 fallback）
+        df_taiex = None
+        df_info = None
+        df_rev = None
+        df_fin = None
+        df_bal = None
+        df_cf = None
+        df_div = None
+        df_per = None
+        df_price = None
+        df_inst = None
+        df_margin = None
+        df_ss = None
+        
+        update_progress(65, "🎯 切換分析師，重新評分（略過 FinMind 撈取）...")
+        scores = get_all_scores(base, profile=selected_profile)
+        
+        update_progress(74, "🎯 [4/5] 產生存股建議（四維度投票）...")
+        try:
+            trade_advice = generate_trade_advice(
+                stock_id=stock_id, df=base, scores=scores,
+                current_shares=shares if has_position else 0,
+                average_cost=avg_price if has_position else 0.0,
+            )
+        except Exception:
+            trade_advice = None
+        
+        update_progress(77, "🎯 [4/5] 產生基本建議...")
+        advice = get_advice(scores)
+        
+        # AI 解說（如有 API key）
+        ai_result = None
+        if deepseek_api_key:
+            update_progress(90, "🤖 AI 解說分析（呼叫 DeepSeek）...")
+            try:
+                from news.database import get_aggregate_sentiment
+                sentiment_data = get_aggregate_sentiment(stock_id)
+            except Exception:
+                sentiment_data = None
+            ai_result = analyze_with_deepseek(
+                stock_id=stock_id, stock_name=stock_name,
+                scores=scores, advice=advice,
+                has_position=has_position, avg_price=avg_price, shares=shares,
+                api_key=deepseek_api_key, trade_advice=trade_advice,
+                sentiment_data=sentiment_data,
+            )
+        
+        # 存入 profile-specific score cache
+        st.session_state[cache_key] = {
+            "scores": scores,
+            "advice": advice,
+            "trade_advice": trade_advice,
+            "ai_result": ai_result,
+        }
+        _has_cache = True
+        
+        # 持久化 score cache 到 SQLite
+        try:
+            from news.database import save_analysis_cache
+            save_analysis_cache(
+                stock_id=stock_id, scores=scores, advice=advice,
+                ai_result=ai_result, trade_advice=trade_advice,
+                fetch_info=fetch_info, stock_name=stock_name,
+                profile=selected_profile,
+            )
+        except Exception:
+            pass
+        
+        update_progress(100, "✅ 重新評分完成！")
+        progress_bar.empty()
+        status_text.empty()
+    
+    if not _has_raw_cache and not _need_rescore:
         # ===== 第 1 段：📥 撈取資料 (0-30%) =====
         update_progress(5, "📥 [1/5] 撈取股價資料（3年，足夠計算 Debt_Ratio_Trend/EPS_YoY）...")
         df_price = fetch_stock_price(stock_id, start_3y, end_str, finmind_token)
@@ -688,7 +813,7 @@ try:
         
         # ===== 第 4 段：🎯 評分分析 (65-80%) =====
         update_progress(67, "🎯 [4/5] 四風格打分（短線、波段、價值、定存）...")
-        scores = get_all_scores(base)
+        scores = get_all_scores(base, profile=selected_profile)
         
         update_progress(74, "🎯 [4/5] 產生存股建議（四維度投票）...")
         try:
@@ -754,28 +879,22 @@ try:
         else:
             update_progress(95, "🤖 [5/5] 未設定 API Key，跳過 AI 解說")
         
-        # 存入快取（包含所有原始資料，供圖表使用）
+        # 存入快取（兩層）
         st.session_state["analyzed"] = True  # 頂層標記
-        st.session_state[cache_key] = {
+        
+        # Layer 1: raw cache（跨分析師共用）
+        st.session_state[raw_cache_key] = {
             "base": base,
             "fetch_info": fetch_info,
+            "stock_name": stock_name,
+        }
+        
+        # Layer 2: profile-specific score cache
+        st.session_state[cache_key] = {
             "scores": scores,
             "advice": advice,
             "trade_advice": trade_advice,
             "ai_result": ai_result,
-            "stock_name": stock_name,
-            "df_taiex": df_taiex,
-            "df_info": df_info,
-            "df_rev": df_rev,
-            "df_fin": df_fin,
-            "df_bal": df_bal,
-            "df_cf": df_cf,
-            "df_div": df_div,
-            "df_price": df_price,
-            "df_per": df_per,
-            "df_inst": df_inst,
-            "df_margin": df_margin,
-            "df_ss": df_ss,
         }
         
         # 將分析結果持久化到磁碟（SQLite + Parquet），F5 後可直接載入
@@ -789,6 +908,7 @@ try:
                 trade_advice=trade_advice,
                 fetch_info=fetch_info,
                 stock_name=stock_name,
+                profile=selected_profile,
             )
             # 母表存為 Parquet
             cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "cache")
@@ -1355,6 +1475,7 @@ try:
                             dual_bullet_mode=_bt_dual_mode,
                             dual_bullet_drop_pct=_bt_dual_drop,
                             use_sell_score=False,
+                            profile=selected_profile,
                         )
                         bt_conservative = _run_backtest(
                             df=base,
@@ -1368,6 +1489,7 @@ try:
                             dual_bullet_mode=_bt_dual_mode,
                             dual_bullet_drop_pct=_bt_dual_drop,
                             use_sell_score=False,
+                            profile=selected_profile,
                         )
                         # 賣出評分版本（如有勾選）
                         bt_active_sell = None
@@ -1384,6 +1506,7 @@ try:
                                 dual_bullet_mode=_bt_dual_mode,
                                 dual_bullet_drop_pct=_bt_dual_drop,
                                 use_sell_score=True,
+                                profile=selected_profile,
                             )
                             bt_conservative_sell = _run_backtest(
                                 df=base, stock_id=stock_id,
@@ -1396,6 +1519,7 @@ try:
                                 dual_bullet_mode=_bt_dual_mode,
                                 dual_bullet_drop_pct=_bt_dual_drop,
                                 use_sell_score=True,
+                                profile=selected_profile,
                             )
                         st.session_state["bt_active_sell"] = bt_active_sell
                         st.session_state["bt_conservative_sell"] = bt_conservative_sell
@@ -1972,30 +2096,55 @@ try:
             ("swing", "買", "🟢"),
             ("swing", "賣", "🔴"),
         ]
-        cfg_map = {
-            "short_term": ("🔴 短線", "#E74C3C", ["趨勢結構", "動能強度", "成交量", "法人籌碼", "籌碼健康", "波動風險"], [20,20,20,15,15,10], ["trend_structure", "momentum", "volume", "institutional", "chip", "risk"]),
-            "swing": ("🟠 波段", "#E67E22", ["營收動能", "中期趨勢", "籌碼趨勢", "獲利成長", "估值位置", "催化因子"], [25,20,20,15,10,10], ["revenue_momentum", "mid_trend", "institutional_trend", "earnings_growth", "valuation", "catalyst"]),
-        }
+        # v3.0: short_term 支援 8 子項，從 scores 中讀取 profile 權重決定雷達圖標籤
+        _st_profile = st_data["short_term"].get("profile", None)
+        _is_v3 = _st_profile is not None and "inertia_break" in st_data["short_term"].get("breakdown", {})
+        _st_labels_8 = ["趨勢結構", "動能強度", "成交量", "法人籌碼", "籌碼健康", "波動風險", "慣性突破", "籌碼集中"]
+        _st_keys_8 = ["trend_structure", "momentum", "volume", "institutional", "chip", "risk", "inertia_break", "chip_concentration"]
         for idx, (dk, mode, mode_icon) in enumerate(dual_keys):
             with radar_row1[idx]:
-                base_title, color, labels, weights, sub_keys = cfg_map[dk]
                 sd = st_data[dk]
                 bd = sd.get("breakdown", {})
-                vals = [bd.get(sk, 0) for sk in sub_keys]
+                sub_keys = _st_keys_8 if _is_v3 and dk == "short_term" else ["revenue_momentum", "mid_trend", "institutional_trend", "earnings_growth", "valuation", "catalyst"]
                 score = st_buy[dk] if mode == "買" else st_sell[dk]
+                # 根據買/賣模式 + profile 決定雷達圖標籤權重
+                if dk == "short_term" and _is_v3:
+                    from core.scoring_config import STYLE_PROFILES
+                    pw = STYLE_PROFILES[_st_profile]["buy" if mode == "買" else "sell"]
+                    weights_8 = [int(pw[k] * 100) for k in _st_keys_8]
+                    labels = _st_labels_8
+                    color = "#E74C3C"
+                    base_title = "🔴 短線"
+                elif dk == "short_term":
+                    weights_8 = [20, 20, 20, 15, 15, 10]
+                    labels = ["趨勢結構", "動能強度", "成交量", "法人籌碼", "籌碼健康", "波動風險"]
+                    color = "#E74C3C"
+                    base_title = "🔴 短線"
+                else:
+                    weights_8 = [25, 20, 20, 15, 10, 10]
+                    labels = ["營收動能", "中期趨勢", "籌碼趨勢", "獲利成長", "估值位置", "催化因子"]
+                    color = "#E67E22"
+                    base_title = "🟠 波段"
+                vals = [bd.get(sk, 0) for sk in sub_keys]
                 full_title = f"{base_title} {mode_icon}{mode} {score}"
-                fig = _radar_chart(labels, vals, full_title, color, weights)
+                fig = _radar_chart(labels, vals, full_title, color, weights_8)
                 st.pyplot(fig, use_container_width=True)
                 plt.close()
-                # 短線/波段雷達圖下方也加上「查看細項」
+                # v3.0: 短線買賣使用各自權重顯示細項
+                if dk == "short_term" and _is_v3:
+                    _pw = pw  # 已計算的買/賣權重
+                else:
+                    _pw = None
                 breakdown_labels = {
                     # 短線（short_term）
-                    "trend_structure": ("趨勢結構", 20),
-                    "momentum": ("動能強度", 20),
-                    "volume": ("成交量結構", 20),
-                    "institutional": ("法人籌碼", 15),
-                    "chip": ("籌碼健康", 15),
-                    "risk": ("波動風險", 10),
+                    "trend_structure": ("趨勢結構", _pw["trend_structure"] * 100 if _pw else 20),
+                    "momentum": ("動能強度", _pw["momentum"] * 100 if _pw else 20),
+                    "volume": ("成交量結構", _pw["volume"] * 100 if _pw else 20),
+                    "institutional": ("法人籌碼", _pw["institutional"] * 100 if _pw else 15),
+                    "chip": ("籌碼健康", _pw["chip"] * 100 if _pw else 15),
+                    "risk": ("波動風險", _pw["risk"] * 100 if _pw else 10),
+                    "inertia_break": ("慣性突破", _pw["inertia_break"] * 100 if _pw else 0),
+                    "chip_concentration": ("籌碼集中", _pw["chip_concentration"] * 100 if _pw else 0),
                     # 波段（swing）
                     "revenue_momentum": ("營收動能", 25),
                     "mid_trend": ("中期趨勢", 20),
@@ -2384,9 +2533,9 @@ try:
                 
                 # 分類
                 derived_categories = {
-                    "📈 技術面": ["MA_5", "MA_10", "MA_20", "MA_60", "RSI_6", "MA_Alignment", "Volume_Ratio", "MA60_Bias", "ATR", "High_5D", "High_10D", "High_20D", "Vol_MA_5", "Above_MA_5", "Above_MA_10", "Above_MA_20", "Above_MA_60", "Bullish_MA", "Volume_Above_MA5"],
+                    "📈 技術面": ["MA_5", "MA_10", "MA_20", "MA_60", "RSI_6", "MA_Alignment", "Volume_Ratio", "MA60_Bias", "ATR", "High_5D", "High_10D", "High_20D", "Vol_MA_5", "Above_MA_5", "Above_MA_10", "Above_MA_20", "Above_MA_60", "Bullish_MA", "Volume_Above_MA5", "Low_10D", "Consec_Up_Days", "Consec_Down_Days"],
                     "🏦 籌碼面": ["Foreign_Net", "Trust_Net", "Dealer_Net", "Inst_Net", "Inst_5D_Net", "Inst_20D_Net", "Chip_Divergence", "Margin_5D_Change", "Short_5D_Change", "SBL_5D_Change", "Inst_Consecutive_Days"],
-                    "📊 基本面": ["Revenue_YoY", "Revenue_MoM", "Revenue_Accelerating", "Revenue_Momentum", "Price_Revenue_Divergence", "TTM_EPS", "TTM_EPS_Valid", "TTM_FCF", "TTM_OCF", "TTM_OperatingCF", "TTM_CAPEX", "TTM_NetIncome", "ROE_TTM", "ROE_Stability", "ROA_TTM", "Gross_Margin", "Gross_Margin_Stability", "Operating_Margin", "Current_Ratio", "Interest_Coverage", "EPS_Stability", "EPS_YoY", "EPS_YoY_Reason", "Debt_Ratio", "Debt_Ratio_Trend", "PE_Percentile", "PB_Percentile", "pe_ratio", "pb_ratio"],
+                    "📊 基本面": ["Revenue_YoY", "Revenue_MoM", "Revenue_Accelerating", "Revenue_12M_High", "Revenue_6M_High", "Revenue_Momentum", "Price_Revenue_Divergence", "TTM_EPS", "TTM_EPS_Valid", "TTM_FCF", "TTM_OCF", "TTM_OperatingCF", "TTM_CAPEX", "TTM_NetIncome", "ROE_TTM", "ROE_Stability", "ROA_TTM", "Gross_Margin", "Gross_Margin_Stability", "Operating_Margin", "Current_Ratio", "Interest_Coverage", "EPS_Stability", "EPS_YoY", "EPS_YoY_Reason", "Debt_Ratio", "Debt_Ratio_Trend", "PE_Percentile", "PB_Percentile", "pe_ratio", "pb_ratio"],
                     "💰 股利面": ["dividend_yield", "cash_dividend_total", "cash_dividend", "cash_statutory", "Payout_Ratio", "Payout_Ratio_Stability", "FCF_Coverage", "FCF_vs_Dividend", "Dividend_Continuity_Years", "Data_Years_Available"],
                 }
                 
@@ -2411,9 +2560,9 @@ try:
                     
                     # 分類顯示
                     latest_categories = {
-                        "📈 技術面": ["close", "volume", "MA_5", "MA_10", "MA_20", "MA_60", "RSI_6", "MA_Alignment", "Volume_Ratio", "MA60_Bias", "ATR"],
+                        "📈 技術面": ["close", "volume", "MA_5", "MA_10", "MA_20", "MA_60", "RSI_6", "MA_Alignment", "Volume_Ratio", "MA60_Bias", "ATR", "Low_10D", "Consec_Up_Days", "Consec_Down_Days"],
                         "🏦 籌碼面": ["Foreign_Net", "Trust_Net", "Dealer_Net", "Inst_5D_Net", "Inst_20D_Net", "Margin_5D_Change", "Short_5D_Change", "SBL_5D_Change", "Inst_Consecutive_Days"],
-                        "📊 基本面": ["Revenue_YoY", "Revenue_MoM", "Revenue_Accelerating", "Revenue_Momentum", "TTM_EPS", "TTM_EPS_Valid", "TTM_FCF", "TTM_OCF", "ROE_TTM", "ROE_Stability", "ROA_TTM", "Gross_Margin", "Debt_Ratio", "Current_Ratio", "Interest_Coverage", "PE_Percentile", "PB_Percentile"],
+                        "📊 基本面": ["Revenue_YoY", "Revenue_MoM", "Revenue_Accelerating", "Revenue_12M_High", "Revenue_6M_High", "Revenue_Momentum", "TTM_EPS", "TTM_EPS_Valid", "TTM_FCF", "TTM_OCF", "ROE_TTM", "ROE_Stability", "ROA_TTM", "Gross_Margin", "Debt_Ratio", "Current_Ratio", "Interest_Coverage", "PE_Percentile", "PB_Percentile"],
                         "💰 股利面": ["dividend_yield", "cash_dividend_total", "Payout_Ratio", "FCF_Coverage", "Dividend_Continuity_Years", "Data_Years_Available"],
                     }
                     

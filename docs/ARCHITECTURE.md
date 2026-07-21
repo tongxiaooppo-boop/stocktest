@@ -112,3 +112,25 @@ taiwan-stock-analyzer-v3/
 | Session | `st.session_state` | 側邊欄「強制刷新資料」按鈕 |
 | SQLite | `news_sentiment.db` (analysis_cache 表) | `delete_analysis_cache('all')` |
 | Parquet | `data/cache/*.parquet` | 手動刪除檔案 |
+
+## ui/ — 前端 UI 模組（v3.2 新增）
+
+```
+ui/
+├── __init__.py                  # 模組初始化
+├── components.py                # 共用元件（FIELD_CN_MAP, cn(), _radar_chart()）
+├── sidebar.py                   # 側邊欄 UI（API 金鑰、分析師選擇、持股輸入）
+├── waterfall_info.py            # 瀑布流 1：大盤資訊卡 + 個股資訊卡
+├── waterfall_charts.py          # 瀑布流 2：圖表區（短線/中長線/回測/新聞）
+├── waterfall_scores.py          # 瀑布流 3：四維度分析卡 + 雷達圖
+├── waterfall_ai.py              # 瀑布流 4：AI 解說區塊
+├── waterfall_debug.py           # 瀑布流 5：除錯面板（5 個 tab）
+└── waterfall_bt_summary.py      # 瀑布流 6：回測結果摘要
+```
+
+**設計原則**：
+- 每個 waterfall 區塊為獨立函數（如 `render_waterfall_2(st, base, df_fin, ...)`）
+- 共用元件（`FIELD_CN_MAP`、`cn()`、`_radar_chart()`）放在 `components.py`，其他模組透過 import 引用
+- `app.py` 只負責：快取判斷 → 撈取資料 → 呼叫各函數渲染瀑布流
+- 各模組可獨立測試，修改某個區塊不影響其他功能
+

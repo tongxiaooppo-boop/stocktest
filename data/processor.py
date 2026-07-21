@@ -183,8 +183,13 @@ def build_universal_base_table(
         df_rev["Revenue_MoM"] = df_rev["revenue"].pct_change() * 100
         df_rev["Revenue_MoM"] = df_rev["Revenue_MoM"].fillna(0)
         
+        # Revenue_12M_High / Revenue_6M_High（v3.1：波段 catalyst 創新高判斷）
+        df_rev["Revenue_12M_High"] = df_rev["revenue"] >= df_rev["revenue"].rolling(12, min_periods=1).max()
+        df_rev["Revenue_6M_High"] = df_rev["revenue"] >= df_rev["revenue"].rolling(6, min_periods=1).max()
+
         # 準備對齊用的欄位
-        df_rev_align = df_rev[["announce_date", "revenue", "revenue_year", "revenue_month", "Revenue_YoY", "Revenue_MoM"]].copy()
+        df_rev_align = df_rev[["announce_date", "revenue", "revenue_year", "revenue_month",
+                               "Revenue_YoY", "Revenue_MoM", "Revenue_12M_High", "Revenue_6M_High"]].copy()
         df_rev_align = df_rev_align.rename(columns={"announce_date": "date"})
         df_rev_align["date"] = pd.to_datetime(df_rev_align["date"])
         df_rev_align = df_rev_align.sort_values("date")
@@ -440,6 +445,18 @@ def calculate_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
         # Low_5D（Phase 2：短線支撐位，用於 score_momentum 判斷破底）
         result["Low_5D"] = result[price_col].rolling(window=5, min_periods=5).min()
         
+        # Low_10D（v3.0：用於 score_inertia_break 判斷跌破前10日低點）
+        result["Low_10D"] = result[price_col].rolling(window=10, min_periods=10).min()
+        
+        # Consec_Up_Days / Consec_Down_Days（v3.0：連續漲跌天數）
+        daily_diff = result[price_col].diff()
+        result["Consec_Up_Days"] = (
+            daily_diff.gt(0).groupby(daily_diff.le(0).cumsum()).cumsum().astype(int)
+        )
+        result["Consec_Down_Days"] = (
+            daily_diff.lt(0).groupby(daily_diff.ge(0).cumsum()).cumsum().astype(int)
+        )
+        
         # Dist_High_5D（Phase 2：距離5日高點%，用於 score_momentum）
         if price_col in result.columns and "High_5D" in result.columns:
             result["Dist_High_5D"] = (result[price_col] - result["High_5D"]) / result[price_col].replace(0, np.nan) * 100
@@ -472,10 +489,6 @@ def calculate_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
     elif "volume" in result.columns:
         result["Vol_MA_5"] = result["volume"].rolling(window=5, min_periods=5).mean()
     
-    # === 營收 MoM ===
-    # Revenue_YoY 和 Revenue_MoM 已在 build_universal_base_table 中從原始營收資料計算並 merge_asof 到母表
-    # 此處不再重複計算，避免母表所有 month_revenue 相同導致 pct_change = 0
-    
     # === TTM EPS ===
     eps_col = None
     for col in result.columns:
@@ -504,14 +517,12 @@ def calculate_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
         result["TTM_FCF"] = result["TTM_OperatingCF"] - result["TTM_CAPEX"]
     
     # === PE/PB Percentile ===
-    # 先過濾 EPS 為負的區間再計算百分位
     if "pe_ratio" in result.columns:
         if eps_col:
             result["pe_ratio_valid"] = result["pe_ratio"].where(result[eps_col] > 0, np.nan)
         else:
             result["pe_ratio_valid"] = result["pe_ratio"]
         
-        # 計算百分位（至少需 120 筆 = 約半年交易日，降低門檻讓1年資料也能算）
         valid_pe = result["pe_ratio_valid"].dropna()
         if len(valid_pe) >= 120:
             result["PE_Percentile"] = result["pe_ratio_valid"].rank(pct=True) * 100
@@ -519,18 +530,14 @@ def calculate_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
             result["PE_Percentile"] = np.nan
     
     # === 用 TTM_EPS 覆蓋 pe_ratio，確保 PE 與 TTM_EPS 一致 ===
-    # 原本 pe_ratio 是從 FinMind TaiwanStockPER 外抓的，
-    # 但 TTM_EPS 是自己用 EPS rolling 4 季算的，兩者可能不一致。
-    # 修正：用 close / TTM_EPS 重新計算 pe_ratio，確保評分邏輯一致。
     if "TTM_EPS" in result.columns and "close" in result.columns:
         ttm_eps_valid = result.get("TTM_EPS_Valid", pd.Series(True, index=result.index))
         mask = (result["TTM_EPS"] > 0) & ttm_eps_valid
         result["pe_ratio"] = np.where(
             mask,
             result["close"] / result["TTM_EPS"],
-            result.get("pe_ratio", np.nan)  # TTM_EPS 無效時保留原始值
+            result.get("pe_ratio", np.nan)
         )
-        # 同步更新 pe_ratio_valid
         if "pe_ratio_valid" in result.columns:
             result["pe_ratio_valid"] = result["pe_ratio"].where(mask, np.nan)
 
@@ -543,8 +550,6 @@ def calculate_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
             result["PB_Percentile"] = np.nan
     
     # === cash_dividend_total（現金股利總額） ===
-    # 已在 build_universal_base_table 中按 year_num 加總年化（季配息×4）
-    # 若 cash_total 存在則直接使用，否則從 cash_dividend + cash_statutory 加總
     if "cash_total" in result.columns:
         result["cash_dividend_total"] = result["cash_total"]
     elif "cash_dividend" in result.columns or "cash_statutory" in result.columns:
@@ -561,8 +566,6 @@ def calculate_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
         result["TTM_OCF"] = result["TTM_OperatingCF"]
     
     # === Data_Years_Available ===
-    # 已在 build_universal_base_table 中從原始財報日期預先計算，
-    # 此處保留該欄位不做覆蓋（若不存在則補計算）
     if "Data_Years_Available" not in result.columns:
         if eps_col is not None:
             eps_dates = result.loc[result[eps_col].notna(), "date"]

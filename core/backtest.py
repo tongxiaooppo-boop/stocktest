@@ -81,6 +81,7 @@ def run_backtest(
     dual_bullet_mode: str = "dip",
     dual_bullet_drop_pct: float = -8.0,
     use_sell_score: bool = False,
+    profile: str = "stable",
 ) -> BacktestResult:
     """
     執行完整回測
@@ -96,8 +97,9 @@ def run_backtest(
         strategy: 策略名稱
         dual_bullet: 是否啟用雙彈夾分批建倉
         dual_bullet_mode: 加碼模式（dip=下跌加碼, breakout=順勢突破）
-        dual_bullet_drop_pct: 下跌加碼門檻（預設 -8%）
+         dual_bullet_drop_pct: 下跌加碼門檻（預設 -8%）
         use_sell_score: 若 True，短線/波段賣出使用獨立賣出評分（total_sell）
+        profile: 分析師人格（chaser/stable），影響短線回測分數
     
     Returns:
         BacktestResult: 完整回測結果
@@ -119,6 +121,7 @@ def run_backtest(
         start_date=start_date,
         end_date=end_date,
         freq=freq,
+        profile=profile,
     )
     
     if hist_df.empty:

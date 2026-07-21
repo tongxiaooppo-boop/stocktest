@@ -442,3 +442,74 @@ INDUSTRY_DEBT_BIAS = {
     "value_penalty": 0.85,
     "dividend_penalty": 0.85,
 }
+
+
+# ============================================================
+# 雙分析師短線權重（v3.0 新增，僅使用 FinMind 免費版可得資料）
+# ============================================================
+
+# 激進型分析師
+CHASER_BUY_WEIGHTS = {
+    "momentum": 0.30,
+    "inertia_break": 0.25,
+    "volume": 0.20,
+    "trend_structure": 0.10,
+    "risk": 0.05,
+    "chip_concentration": 0.05,
+    "institutional": 0.05,
+    "chip": 0.00,
+}
+CHASER_SELL_WEIGHTS = {
+    "momentum": 0.25,
+    "inertia_break": 0.35,
+    "volume": 0.15,
+    "trend_structure": 0.10,
+    "risk": 0.10,
+    "chip_concentration": 0.00,
+    "institutional": 0.05,
+    "chip": 0.00,
+}
+
+# 穩重型分析師
+STABLE_BUY_WEIGHTS = {
+    "trend_structure": 0.35,
+    "institutional": 0.20,
+    "chip_concentration": 0.20,
+    "volume": 0.10,
+    "inertia_break": 0.05,
+    "momentum": 0.05,
+    "chip": 0.05,
+    "risk": 0.00,
+}
+STABLE_SELL_WEIGHTS = {
+    "trend_structure": 0.35,
+    "institutional": 0.15,
+    "chip_concentration": 0.25,
+    "volume": 0.10,
+    "inertia_break": 0.10,
+    "momentum": 0.05,
+    "chip": 0.00,
+    "risk": 0.00,
+}
+
+STYLE_PROFILES = {
+    "chaser": {"buy": CHASER_BUY_WEIGHTS, "sell": CHASER_SELL_WEIGHTS},
+    "stable": {"buy": STABLE_BUY_WEIGHTS, "sell": STABLE_SELL_WEIGHTS},
+}
+
+# 慣性突破/破壞門檻
+INERTIA_THRESHOLDS = {
+    "high_n_days": 10,
+    "low_n_days": 10,
+    "consec_days_required": 3,
+}
+
+# 籌碼密集區（多日 POC 代理）參數
+CHIP_CONCENTRATION_THRESHOLDS = {
+    "lookback_days": 60,
+    "num_bins": 30,
+    "dist_excellent": 5.0,
+    "dist_good": 1.0,
+    "dist_normal": -2.0,
+    "dist_weak": -5.0,
+}

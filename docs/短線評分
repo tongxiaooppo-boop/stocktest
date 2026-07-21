@@ -1,0 +1,247 @@
+# 短線評分程式實作說明
+
+## 目錄
+
+1. [主函式架構](#1-主函式架構)
+2. [評分流程總覽](#2-評分流程總覽)
+3. [子項評分函式（6 子項，原始版）](#3-子項評分函式6-子項原始版)
+4. [v3.0 雙分析師系統（8 子項）](#4-v30-雙分析師系統8-子項)
+   - [4.1 架構總覽](#41-架構總覽)
+   - [4.2 慣性突破/破壞（inertia_break）](#42-慣性突破破壞inertia_break)
+   - [4.3 籌碼密集區（chip_concentration）](#43-籌碼密集區chip_concentration)
+   - [4.4 雙分析師權重表](#44-雙分析師權重表)
+5. [Modifier 疊加](#5-modifier-疊加)
+6. [例外處理](#6-例外處理)
+7. [門檻對照表](#7-門檻對照表)
+
+---
+
+## 1. 主函式架構
+
+**檔案位置**: `core/scorer.py`
+
+### 原始版（6 子項）— `score_short_term(row)`（向後相容，保留不動）
+
+```
+score_short_term(row)
+    ├── score_trend_structure(row)    # 權重 15%（買）/ 25%（賣）
+    ├── score_momentum(row)           # 權重 25%（買）/ 15%（賣）
+    ├── score_volume_structure(row)   # 權重 25%（買）/ 10%（賣）
+    ├── score_institutional(row)      # 權重 15%（買）/ 5%（賣）
+    ├── score_chip_health(row)        # 權重 10%（買）/ 15%（賣）
+    └── score_volatility_risk(row)    # 權重 10%（買）/ 30%（賣）
+              ↓
+        加權總分 (base_score)
+              ↓
+    apply_all_modifiers()
+              ↓
+        最終短線總分 (0-100)
+```
+
+### v3.0 雙分析師版（8 子項）— `score_short_term_by_profile(row, profile, price_history=None)`
+
+```
+score_short_term_by_profile(row, profile)
+    ├── score_trend_structure(row)         # 共用
+    ├── score_momentum(row)                # 共用
+    ├── score_volume_structure(row)        # 共用
+    ├── score_institutional(row)           # 共用
+    ├── score_chip_health(row)             # 共用
+    ├── score_volatility_risk(row)         # 共用
+    ├── score_inertia_break(row)           # 🆕 v3.0 新增
+    └── score_chip_concentration(row)      # 🆕 v3.0 新增
+              ↓
+    STYLE_PROFILES[profile]["buy"] 或 ["sell"] 加權
+              ↓
+        最終短線總分 (0-100)
+```
+
+**權重設定檔**: `core/scoring_config.py`
+
+v3.0 新增：
+```python
+STYLE_PROFILES = {
+    "chaser": {"buy": CHASER_BUY_WEIGHTS, "sell": CHASER_SELL_WEIGHTS},
+    "stable": {"buy": STABLE_BUY_WEIGHTS, "sell": STABLE_SELL_WEIGHTS},
+}
+```
+
+**回傳格式**（雙分析師版在原始格式基礎上增加 `profile` 欄位）：
+
+```python
+{
+    "profile": str,        # "chaser" | "stable"
+    "total_buy": int,
+    "total_sell": int,
+    "breakdown": {         # 8 子項
+        "trend_structure": int, "momentum": int, "volume": int,
+        "institutional": int, "chip": int, "risk": int,
+        "inertia_break": int, "chip_concentration": int,
+    },
+    "details": { ... }
+}
+```
+
+---
+
+## 2. 評分流程總覽
+
+### v3.0 版（8 子項）
+
+流程與原始版相同，差異：
+1. 多兩個子項（inertia_break、chip_concentration）
+2. 權重由 `STYLE_PROFILES[profile]` 動態決定
+3. `chip_concentration` 的 CCP 距離已由 `stock/metrics.py` 預算至 `row["Distance_CCP"]`，子項內僅做最後門檻比對（效能最大化）
+4. 若 `Distance_CCP` 為 NaN（新股不足 20 日），回傳中性 50 分
+
+---
+
+## 3. 子項評分函式（6 子項，原始版）
+
+（此節與 v2.2 版本相同，六個子項定義不變。完整內容請參閱 `docs/SCORING.md`。）
+
+---
+
+## 4. v3.0 雙分析師系統（8 子項）
+
+### 4.1 架構總覽
+
+雙分析師系統在既有 6 子項基礎上新增 2 個獨立子項，形成 8 子項架構。兩個分析師人格各自保有獨立的買/賣權重表。
+
+**設計原則**：
+- **零破壞**：`score_short_term()` 原始版一行不動
+- **零新增 API**：新增子項的資料源全部來自既有 `TaiwanStockPrice`（Free）
+- **共用分箱**：籌碼密集區的 histogram/分箱邏輯獨立於 `stock/chip_concentration.py`，metrics 預算與 scorer fallback 呼叫同一函式
+- **預算優先**：`Distance_CCP` 由 metrics 預算寫入 row，scorer 僅做門檻比對
+
+### 4.2 慣性突破/破壞（inertia_break）
+
+**函式簽章**: `score_inertia_break(row, high_n=10, low_n=10, consec_required=3) -> dict`
+
+**資料來源**: `TaiwanStockPrice`（Free）— 日K close/open/high/low，由 `stock/metrics.py` 計算
+- `High_10D`：近 10 日最高價（`high.rolling(10).max()`）
+- `Low_10D`：近 10 日最低價（`low.rolling(10).min()`）
+- `Consec_Up_Days`：連續收紅天數（`close > prev_close` 正負號分組累計）
+- `Consec_Down_Days`：連續收黑天數（`close < prev_close` 正負號分組累計）
+
+**評分表**:
+
+| 分數 | 條件 |
+|---|---|
+| 100 | 突破前10日高點 且 連漲 ≥ 3 日 |
+| 85 | 突破前10日高點 或 連漲 ≥ 3 日 |
+| 70 | 收盤價高於 5 日均線但無明顯突破 |
+| 50 | 盤整 |
+| 0 | 跌破前10日低點 或 連跌 ≥ 3 日 |
+
+**例外處理**：
+- `close` 為 NaN → 回傳 0 分 + `note: "close 資料不足"`
+- `High_10D`/`Low_10D` 為 NaN（資料不足 10 日）→ `break_high`/`break_low` 為 False，落入盤整判斷
+
+### 4.3 籌碼密集區（chip_concentration）
+
+**函式簽章**: `score_chip_concentration(row, price_history=None) -> dict`
+
+**核心思路**：短線策略真正需要的是「過去一段時間，多方籌碼主要套在哪個價位帶」。用多日收盤價 × 成交量的加權分布估計 CCP。
+
+**運算方式**（實作於 `stock/chip_concentration.py`）：
+1. 取近 N 日（預設 60）的 `close` 與 `volume`
+2. 依收盤價將區間分箱（預設 30 個 bin）
+3. 每個 bin 累加落在該價格區間的成交量
+4. 找出成交量最大的 bin，其中心價位即為 CCP
+5. 計算 `Distance = (close - CCP) / CCP × 100`（%）
+
+**效能優化**：
+- `stock/metrics.py` 在 `calculate_technical_indicators()` 中預算 `Distance_CCP` 寫入 row
+- `score_chip_concentration()` 優先使用 `row["Distance_CCP"]`
+- 若 `Distance_CCP` 為 NaN（新股不足 20 日），回傳中性 50 分
+
+**評分表**（Distance = 現價距離密集區中心的百分比）：
+
+| 分數 | 條件 |
+|---|---|
+| 100 | Distance ≥ 5%（站穩在密集區上方） |
+| 85 | 1% ~ 5%（剛站上密集區） |
+| 70 | -2% ~ 1%（正在測試密集區） |
+| 50 | -5% ~ -2%（跌破密集區，測試支撐） |
+| 0 | Distance < -5%（深跌破密集區） |
+
+### 4.4 雙分析師權重表
+
+**追熱門股分析師**（`CHASER_BUY_WEIGHTS` / `CHASER_SELL_WEIGHTS`）：
+
+| 子項 | 買入 | 賣出 | 說明 |
+|---|---|---|---|
+| 動能強度/減速 | 30% | 10% | 買看爆發、賣看是否真的失速 |
+| 慣性突破/破壞 | 25% | 35% | 短線核心，賣出權重最高 |
+| 成交量結構/異常 | 15% | 15% | 攻擊量 vs 爆量出貨 |
+| 趨勢結構/破壞 | 15% | 20% | 賣出更重視均線失守 |
+| 波動風險/過熱 | 5% | 10% | 賣出放大過熱權重 |
+| 籌碼密集區 | 5% | 5% | 短線參考 |
+| 三大法人進出 | 5% | 5% | 大額籌碼監控 |
+| 散戶籌碼健康 | 0% | 0% | 不看散戶 |
+
+**穩重型分析師**（`STABLE_BUY_WEIGHTS` / `STABLE_SELL_WEIGHTS`）：
+
+| 子項 | 買入 | 賣出 | 說明 |
+|---|---|---|---|
+| 趨勢結構/破壞 | 37% | 37% | 穩重型進出場核心 |
+| 三大法人進出 | 18% | 23% | 最主要籌碼依據 |
+| 籌碼密集區 | 15% | 15% | 支撐/壓力參考 |
+| 成交量結構/異常 | 10% | 10% | 常態監控 |
+| 慣性突破/破壞 | 5% | 10% | 賣出提高防慣性轉空 |
+| 動能強度/減速 | 5% | 5% | 不做短線動能決策 |
+| 散戶籌碼健康 | 5% | 0% | 買入評估籌碼沉澱 |
+| 波動風險/過熱 | 5% | 0% | 不因過熱賣出 |
+
+---
+
+## 5. Modifier 疊加
+
+（同原始版，參見 `docs/SCORING.md` Modifier 章節。）
+
+---
+
+## 6. 例外處理
+
+### 新增子項防禦（v3.0）
+
+| 子項 | 防禦策略 |
+|:-----|:---------|
+| inertia_break | `close` 為 NaN → 0 分；`High_10D`/`Low_10D` 為 NaN（資料<10日）→ 視同未突破 |
+| chip_concentration | `Distance_CCP` 為 NaN（新股<20日）→ 50 分中性；價格區間過窄 → 50 分 |
+
+### 金融業處理
+
+短線評分的所有子項均無金融業特殊跳過邏輯。金融業在短線評分中的影響僅限於 `apply_all_modifiers` 中的 Risk Penalty/Bonus。
+
+---
+
+## 7. 門檻對照表
+
+| 子項 | 原始版買/賣 | 追熱門買/賣 | 穩重買/賣 | 程式函式 |
+|:---|:---:|:---:|:---:|:---|
+| trend_structure | 15%/25% | 15%/20% | 37%/37% | `score_trend_structure()` |
+| momentum | 25%/15% | 30%/10% | 5%/5% | `score_momentum()` |
+| volume | 25%/10% | 15%/15% | 10%/10% | `score_volume_structure()` |
+| institutional | 15%/5% | 5%/5% | 18%/23% | `score_institutional()` |
+| chip | 10%/15% | 0%/0% | 5%/0% | `score_chip_health()` |
+| risk | 10%/30% | 5%/10% | 5%/0% | `score_volatility_risk()` |
+| inertia_break | — | 25%/35% | 5%/10% | `score_inertia_break()` 🆕 |
+| chip_concentration | — | 5%/5% | 15%/15% | `score_chip_concentration()` 🆕 |
+
+### 相關檔案索引
+
+| 檔案 | 說明 |
+|:-----|:-----|
+| `core/scorer.py` | 評分主程式（含 v3.0 雙分析師） |
+| `core/scoring_config.py` | 權重與門檻設定檔（含 CHASER_*/STABLE_*/STYLE_PROFILES） |
+| `stock/chip_concentration.py` | v3.0 共用分箱模組 |
+| `stock/metrics.py` | 技術指標計算（含 High_10D/Low_10D/Consec_Up_Days/Consec_Down_Days/Distance_CCP） |
+| `docs/SCORING.md` | 四種風格評分細則說明文件 |
+
+---
+
+> **版本**: v3.0  
+> **最後更新**: 2026-07-20  
+> **相關文件**: [SCORING.md](./SCORING.md) | [CHANGELOG.md](./CHANGELOG.md)

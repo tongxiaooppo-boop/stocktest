@@ -107,6 +107,11 @@ def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
         acc = result["Revenue_Accelerating"].fillna(False)
         result["Revenue_Momentum"] = (acc & acc.shift(1) & acc.shift(2)).astype(int)
     
+    # === Revenue_12M_High / Revenue_6M_High (v3.1 catalyst 解耦) ===
+    if "month_revenue" in result.columns:
+        result["Revenue_12M_High"] = _compute_revenue_high(result, window=12)
+        result["Revenue_6M_High"] = _compute_revenue_high(result, window=6)
+    
     # === Price_Revenue_Divergence ===
     if "close" in result.columns and "Revenue_YoY" in result.columns:
         price_high_20d = result["close"].rolling(20).max()
@@ -261,6 +266,45 @@ def _compute_eps_qoq_quarterly(result, eps_col):
         on="date", direction="backward",
     )
     return result_with_date["_eps_qoq"]
+
+
+def _compute_revenue_high(result, window: int):
+    """
+    v3.1 catalyst 解耦：計算月營收是否創近 N 個月新高
+
+    對 month_revenue 欄位做 rolling max 比較：
+    若本月營收 >= 過去 window 個月內的最大值，回傳 True。
+
+    使用 >= 而非 == 以避免浮點數比較誤差；min_periods=1 確保
+    新股/資料不足時仍可運算（此時等同於「至今最高」，不會整批判 False）。
+
+    Returns:
+        pd.Series[bool]: 每個日期是否創近 window 個月新高
+    """
+    if "month_revenue" not in result.columns:
+        return pd.Series(False, index=result.index)
+
+    s = result["month_revenue"]
+    # 僅取營收數值有變化的列（新月營收發布日），避免同日重複資料干擾 rolling
+    is_new = pd.Series(False, index=result.index) | (s.diff().abs() > 1e-4)
+    if pd.notna(s.iloc[0]):
+        is_new.iloc[0] = True
+
+    monthly = result.loc[is_new, ["date", "month_revenue"]].dropna(subset=["month_revenue"]).copy()
+    if monthly.empty:
+        return pd.Series(False, index=result.index)
+
+    monthly = monthly.sort_values("date")
+    rolling_max = monthly["month_revenue"].rolling(window=window, min_periods=1).max()
+    monthly["_is_high"] = monthly["month_revenue"] >= rolling_max
+
+    result_with_date = result[["date"]].copy()
+    merged = pd.merge_asof(
+        result_with_date.sort_values("date"),
+        monthly[["date", "_is_high"]].sort_values("date"),
+        on="date", direction="backward",
+    )
+    return merged["_is_high"].fillna(False).values
 
 
 def _compute_cagr_3y(result):

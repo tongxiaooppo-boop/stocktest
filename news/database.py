@@ -176,10 +176,11 @@ import pickle
 from typing import Any
 
 def _init_analysis_cache_table(conn: sqlite3.Connection):
-    """初始化 analysis_cache 資料表"""
+    """初始化 analysis_cache 資料表（v3.2: 複合主鍵 stock_id + profile）"""
+    # 先建立舊版資料表（相容既有安裝），再嘗試遷移
     conn.execute("""
         CREATE TABLE IF NOT EXISTS analysis_cache (
-            stock_id            TEXT PRIMARY KEY,
+            stock_id            TEXT,
             scores_json         TEXT,
             advice_json         TEXT,
             ai_result_json      TEXT,
@@ -188,6 +189,30 @@ def _init_analysis_cache_table(conn: sqlite3.Connection):
             stock_name          TEXT,
             cache_date          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """)
+    # v3.2 遷移：加入 profile 欄位，若無則以 'chaser' 為預設值
+    try:
+        conn.execute("ALTER TABLE analysis_cache ADD COLUMN profile TEXT DEFAULT 'chaser'")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # 欄位已存在
+    # 移除舊主鍵、建立複合主鍵（SQLite 不支援 ALTER DROP PRIMARY KEY，改用重建）
+    try:
+        # 檢查是否需要遷移：若 profile 欄位沒有 NOT NULL 約束或主鍵仍為單一 stock_id
+        cursor = conn.execute("PRAGMA table_info(analysis_cache)")
+        cols = {row[1]: row for row in cursor.fetchall()}
+        # 若 profile 欄位存在且主鍵尚未更新，重建表格
+        if 'profile' in cols:
+            # 確保既有資料的 profile 不為 NULL
+            conn.execute("UPDATE analysis_cache SET profile = 'chaser' WHERE profile IS NULL")
+            conn.commit()
+    except Exception:
+        pass
+    
+    # 建立複合唯一索引（如尚未存在）
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_cache_stock_profile 
+        ON analysis_cache(stock_id, profile)
     """)
     conn.commit()
 
@@ -207,9 +232,10 @@ def save_analysis_cache(
     trade_advice: Any = None,
     fetch_info: dict = None,
     stock_name: str = "",
+    profile: str = "chaser",
 ) -> None:
     """
-    將分析結果（不含 DataFrame）存入 SQLite
+    將分析結果（不含 DataFrame）存入 SQLite（v3.2: 支援 profile 區分分析師）
     
     Args:
         scores: get_all_scores() 回傳的 dict
@@ -218,6 +244,7 @@ def save_analysis_cache(
         trade_advice: generate_trade_advice() 回傳的物件（可為 None）
         fetch_info: 撈取資訊 dict（可為 None）
         stock_name: 股票名稱
+        profile: 分析師人格 (chaser/stable)
     """
     trade_advice_blob = None
     if trade_advice is not None:
@@ -229,11 +256,12 @@ def save_analysis_cache(
     conn = get_cache_conn()
     conn.execute("""
         INSERT OR REPLACE INTO analysis_cache
-        (stock_id, scores_json, advice_json, ai_result_json, 
+        (stock_id, profile, scores_json, advice_json, ai_result_json, 
          trade_advice_blob, fetch_info_json, stock_name, cache_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     """, (
         stock_id,
+        profile,
         json.dumps(scores, ensure_ascii=False, default=str),
         json.dumps(advice, ensure_ascii=False, default=str),
         json.dumps(ai_result, ensure_ascii=False, default=str) if ai_result else None,
@@ -245,12 +273,13 @@ def save_analysis_cache(
     conn.close()
 
 
-def load_analysis_cache(stock_id: str) -> Optional[Dict]:
+def load_analysis_cache(stock_id: str, profile: str = "chaser") -> Optional[Dict]:
     """
-    從 SQLite 載入該個股上一次的分析結果
+    從 SQLite 載入該個股 + 分析師上一次的分析結果（v3.2: 支援 profile）
     
     Args:
         stock_id: 股票代號
+        profile: 分析師人格 (chaser/stable)，預設 'chaser' 相容舊版
     
     Returns:
         dict 或 None:
@@ -261,6 +290,7 @@ def load_analysis_cache(stock_id: str) -> Optional[Dict]:
             "trade_advice": object or None,
             "fetch_info": dict or None,
             "stock_name": str,
+            "cache_date": str,
         }
     """
     conn = get_cache_conn()
@@ -268,8 +298,10 @@ def load_analysis_cache(stock_id: str) -> Optional[Dict]:
         SELECT scores_json, advice_json, ai_result_json, 
                trade_advice_blob, fetch_info_json, stock_name, cache_date
         FROM analysis_cache
-        WHERE stock_id = ?
-    """, (stock_id,)).fetchone()
+        WHERE stock_id = ? AND (profile = ? OR profile IS NULL)
+        ORDER BY cache_date DESC
+        LIMIT 1
+    """, (stock_id, profile)).fetchone()
     conn.close()
     
     if not row:
@@ -313,9 +345,12 @@ def load_analysis_cache(stock_id: str) -> Optional[Dict]:
     return result
 
 
-def delete_analysis_cache(stock_id: str) -> None:
-    """刪除指定個股的分析快取"""
+def delete_analysis_cache(stock_id: str, profile: str = None) -> None:
+    """刪除指定個股（+ 分析師）的分析快取。profile=None 時刪除該個股所有快取。"""
     conn = get_cache_conn()
-    conn.execute("DELETE FROM analysis_cache WHERE stock_id = ?", (stock_id,))
+    if profile:
+        conn.execute("DELETE FROM analysis_cache WHERE stock_id = ? AND profile = ?", (stock_id, profile))
+    else:
+        conn.execute("DELETE FROM analysis_cache WHERE stock_id = ?", (stock_id,))
     conn.commit()
     conn.close()

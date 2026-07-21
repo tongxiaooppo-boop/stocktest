@@ -1,4 +1,4 @@
-"""
+r"""
 備份腳本 — 將專案原始碼壓縮為 backup\YYYY-MM-DD_HHMMSS.zip
 排除：__pycache__、.git、venv、data\cache、backup 等
 """
@@ -67,7 +67,7 @@ def backup():
                     count += 1
 
     file_size = os.path.getsize(zip_path)
-    print(f"  ✅ 備份完成：{timestamp}.zip （{count} 個檔案，{file_size:,} 位元組）")
+    print(f"  [OK] 備份完成：{timestamp}.zip （{count} 個檔案，{file_size:,} 位元組）")
 
 
 if __name__ == "__main__":
